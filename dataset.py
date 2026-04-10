@@ -283,7 +283,12 @@ def _build_patch_index(
         try:
             with h5py.File(h5f, "r") as f:
                 # Use CLP as proxy for label validity
+                # CLP = f["Labels/CLP"][()]
+                # H, W = CLP.shape
                 CLP = f["Labels/CLP"][()]
+                CER = f["Labels/CER"][()]
+                COT = f["Labels/COT"][()]
+                CTH = f["Labels/CTH"][()]
                 H, W = CLP.shape
 
                 h_positions = list(range(0, H - ph + 1, sh))
@@ -297,9 +302,31 @@ def _build_patch_index(
                 for i in h_positions:
                     for j in w_positions:
                         patch_clp = CLP[i:i + ph, j:j + pw]
+                        patch_cer = CER[i:i + ph, j:j + pw]
+                        patch_cot = COT[i:i + ph, j:j + pw]
+                        patch_cth = CTH[i:i + ph, j:j + pw]
+
                         n_valid = int(np.isfinite(patch_clp).sum())
-                        if n_valid >= min_valid_px:
-                            index.append((h5f, i, j))
+
+                        cloud_valid = (
+                                np.isfinite(patch_clp) &
+                                (patch_clp > 0) &
+                                np.isfinite(patch_cer) &
+                                np.isfinite(patch_cot) &
+                                np.isfinite(patch_cth)
+                        )
+                        n_cloud_valid = int(cloud_valid.sum())
+
+                        if mode == "train":
+                            if n_valid >= min_valid_px and n_cloud_valid >= max(16, int(ph * pw * 0.05)):
+                                index.append((h5f, i, j))
+                        else:
+                            if n_valid >= min_valid_px:
+                                index.append((h5f, i, j))
+                        # patch_clp = CLP[i:i + ph, j:j + pw]
+                        # n_valid = int(np.isfinite(patch_clp).sum())
+                        # if n_valid >= min_valid_px:
+                        #     index.append((h5f, i, j))
 
         except Exception as exc:
             log.warning("Skip %s during index build: %s", h5f, exc)

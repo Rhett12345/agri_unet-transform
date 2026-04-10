@@ -76,7 +76,8 @@ MODIS_SCALE = {
 
 # MYD06 QC / Phase mapping  → merged to 5 classes (0=clear,1=water,2=supercool,3=mix,4=ice)
 # MYD06 Cloud_Phase_Optical_Properties: 0=unknown,1=ice,2=water,3=mixed,4=ice,5=undetermined,6=bad
-MODIS_PHASE_MAP = {0: 0, 1: 4, 2: 1, 3: 3, 4: 4, 5: 0, 6: 0}
+# MODIS_PHASE_MAP = {0: 0, 1: 4, 2: 1, 3: 3, 4: 4, 5: 0, 6: 0}
+MODIS_PHASE_MAP = {0: -1, 1: 4, 2: 1, 3: 3, 4: 4, 5: -1, 6: -1}
 
 # Maximum spatial distance (km) allowed when snapping MODIS pixel to AGRI pixel
 MAX_MATCH_DIST_KM = 5.0

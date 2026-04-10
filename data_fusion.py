@@ -91,10 +91,26 @@ def _find_day_folders(root: Path, dates: list) -> list:
     return sorted(p for p in root.iterdir() if p.is_dir())
 
 
+# def _find_matching_modis(agri_dt: datetime, modis_files: list) -> list:
+#     td = timedelta(minutes=cfg.MAX_TIME_DIFF_MIN)
+#     return [f for f in modis_files
+#             if (mdt := _parse_modis_datetime(f.name)) and abs(mdt - agri_dt) <= td]
+
 def _find_matching_modis(agri_dt: datetime, modis_files: list) -> list:
     td = timedelta(minutes=cfg.MAX_TIME_DIFF_MIN)
-    return [f for f in modis_files
-            if (mdt := _parse_modis_datetime(f.name)) and abs(mdt - agri_dt) <= td]
+    candidates = []
+
+    for f in modis_files:
+        mdt = _parse_modis_datetime(f.name)
+        if mdt is None:
+            continue
+
+        dt = abs(mdt - agri_dt)
+        if dt <= td:
+            candidates.append((dt, f))
+
+    candidates.sort(key=lambda x: x[0])
+    return [candidates[0][1]] if candidates else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,7 +378,8 @@ def read_myd06(modis_file: Path) -> Optional[dict]:
             return raw * scale
 
         clp_raw = sd.select(cfg.MODIS_VARS["CLP"])[:].astype(np.int32)
-        clp     = np.vectorize(cfg.MODIS_PHASE_MAP.get)(clp_raw, 0).astype(np.int32)
+        # clp     = np.vectorize(cfg.MODIS_PHASE_MAP.get)(clp_raw, 0).astype(np.int32)
+        clp = np.vectorize(lambda x: cfg.MODIS_PHASE_MAP.get(int(x), -1))(clp_raw).astype(np.int16)
         cer     = _read(cfg.MODIS_VARS["CER"], cfg.MODIS_SCALE["CER"])
         cot     = _read(cfg.MODIS_VARS["COT"], cfg.MODIS_SCALE["COT"])
         cth     = _read(cfg.MODIS_VARS["CTH"], cfg.MODIS_SCALE["CTH"])
