@@ -91,25 +91,51 @@ def _stats_worker(h5_path: str) -> Optional[dict]:
     MAX_SAMPLE = 4096   # pixels kept per file for reservoir
 
     try:
+        # with h5py.File(h5_path, "r") as f:
+        #     bt_keys = sorted(f["AGRI/BT"].keys())
+        #     # Read channels one by one to avoid stacking a huge intermediate array
+        #     H, W = f[f"AGRI/BT/{bt_keys[0]}"].shape
+        #     n_agri = len(bt_keys)
+        #
+        #     sum_bt   = np.zeros(n_agri, dtype=np.float64)
+        #     sumsq_bt = np.zeros(n_agri, dtype=np.float64)
+        #
+        #     # Stack BT in one go (full scene is manageable per-channel)
+        #     BT = np.stack(
+        #         [f[f"AGRI/BT/{k}"][()].astype(np.float64) for k in bt_keys],
+        #         axis=-1
+        #     )  # (H, W, C)
+        #
+        #     CLP = f["Labels/CLP"][()].astype(np.float64)
+        #     CER = f["Labels/CER"][()].astype(np.float64)
+        #     COT = f["Labels/COT"][()].astype(np.float64)
+        #     CTH = f["Labels/CTH"][()].astype(np.float64)
+
         with h5py.File(h5_path, "r") as f:
-            bt_keys = sorted(f["AGRI/BT"].keys())
-            # Read channels one by one to avoid stacking a huge intermediate array
-            H, W = f[f"AGRI/BT/{bt_keys[0]}"].shape
-            n_agri = len(bt_keys)
+            if "Samples" in f and "agri" in f["Samples"] and "labels" in f["Samples"]:
+                BT = f["Samples/agri"][()].astype(np.float64)  # (N, C, H, W)
+                lbl = f["Samples/labels"][()].astype(np.float64)  # (N, 4, H, W)
+                n_agri = BT.shape[1]
+                flat_bt = BT.transpose(0, 2, 3, 1).reshape(-1, n_agri)
+                flat_out = lbl.transpose(0, 2, 3, 1).reshape(-1, 4)
+            else:
+                bt_keys = sorted(f["AGRI/BT"].keys())
+                H, W = f[f"AGRI/BT/{bt_keys[0]}"].shape
+                n_agri = len(bt_keys)
 
-            sum_bt   = np.zeros(n_agri, dtype=np.float64)
-            sumsq_bt = np.zeros(n_agri, dtype=np.float64)
+                BT = np.stack(
+                    [f[f"AGRI/BT/{k}"][()].astype(np.float64) for k in bt_keys],
+                    axis=-1
+                )
 
-            # Stack BT in one go (full scene is manageable per-channel)
-            BT = np.stack(
-                [f[f"AGRI/BT/{k}"][()].astype(np.float64) for k in bt_keys],
-                axis=-1
-            )  # (H, W, C)
+                CLP = f["Labels/CLP"][()].astype(np.float64)
+                CER = f["Labels/CER"][()].astype(np.float64)
+                COT = f["Labels/COT"][()].astype(np.float64)
+                CTH = f["Labels/CTH"][()].astype(np.float64)
 
-            CLP = f["Labels/CLP"][()].astype(np.float64)
-            CER = f["Labels/CER"][()].astype(np.float64)
-            COT = f["Labels/COT"][()].astype(np.float64)
-            CTH = f["Labels/CTH"][()].astype(np.float64)
+                # out = np.stack([CLP, CER, COT, CTH], axis=-1)
+                # flat_bt = BT.reshape(-1, n_agri)
+                # flat_out = out.reshape(-1, 4)
 
     except Exception as exc:
         return None   # silently skip; caller will log
@@ -282,6 +308,10 @@ def _build_patch_index(
     for h5f in h5_files:
         try:
             with h5py.File(h5f, "r") as f:
+                if "Samples" in f and "agri" in f["Samples"] and "labels" in f["Samples"]:
+                    n_samples = int(f["Samples/agri"].shape[0])
+                    index.extend((h5f, s, -1) for s in range(n_samples))
+                    continue
                 # Use CLP as proxy for label validity
                 # CLP = f["Labels/CLP"][()]
                 # H, W = CLP.shape
@@ -306,23 +336,37 @@ def _build_patch_index(
                         patch_cot = COT[i:i + ph, j:j + pw]
                         patch_cth = CTH[i:i + ph, j:j + pw]
 
-                        n_valid = int(np.isfinite(patch_clp).sum())
+                        # n_valid = int(np.isfinite(patch_clp).sum())
+                        #
+                        # cloud_valid = (
+                        #         np.isfinite(patch_clp) &
+                        #         (patch_clp > 0) &
+                        #         np.isfinite(patch_cer) &
+                        #         np.isfinite(patch_cot) &
+                        #         np.isfinite(patch_cth)
+                        # )
+                        # n_cloud_valid = int(cloud_valid.sum())
+                        #
+                        # if mode == "train":
+                        #     if n_valid >= min_valid_px and n_cloud_valid >= max(16, int(ph * pw * 0.05)):
+                        #         index.append((h5f, i, j))
+                        # else:
+                        #     if n_valid >= min_valid_px:
+                        #         index.append((h5f, i, j))
 
-                        cloud_valid = (
-                                np.isfinite(patch_clp) &
-                                (patch_clp > 0) &
-                                np.isfinite(patch_cer) &
-                                np.isfinite(patch_cot) &
+                        valid_clp = np.isfinite(patch_clp)
+                        valid_reg = (
+                                np.isfinite(patch_cer) |
+                                np.isfinite(patch_cot) |
                                 np.isfinite(patch_cth)
                         )
-                        n_cloud_valid = int(cloud_valid.sum())
 
-                        if mode == "train":
-                            if n_valid >= min_valid_px and n_cloud_valid >= max(16, int(ph * pw * 0.05)):
-                                index.append((h5f, i, j))
-                        else:
-                            if n_valid >= min_valid_px:
-                                index.append((h5f, i, j))
+                        valid_any = valid_clp | valid_reg
+                        n_valid_any = int(valid_any.sum())
+
+                        if n_valid_any >= min_valid_px:
+                            index.append((h5f, i, j))
+
                         # patch_clp = CLP[i:i + ph, j:j + pw]
                         # n_valid = int(np.isfinite(patch_clp).sum())
                         # if n_valid >= min_valid_px:
@@ -392,22 +436,47 @@ class AGRIMyd06Dataset(Dataset):
         # ── Read only the required patch via HDF5 hyperslab ───────────────
         try:
             with h5py.File(h5f, "r") as f:
-                bt_keys = sorted(f["AGRI/BT"].keys())
-                # Each channel is a 2-D (H, W) dataset; slice individually.
-                bt_patches = [
-                    f[f"AGRI/BT/{k}"][i:i + ph, j:j + pw].astype(np.float32)
-                    for k in bt_keys
-                ]
-                BT = np.stack(bt_patches, axis=-1)   # (ph, pw, C)
+                if j < 0 and "Samples" in f and "agri" in f["Samples"]:
+                    agri_patch = f["Samples/agri"][i].astype(np.float32)  # (C, H, W)
+                    geo_patch = f["Samples/geo"][i].astype(np.float32)  # (4, H, W)
+                    label_patch = f["Samples/labels"][i].astype(np.float32)  # (4, H, W)
 
-                lat = f["AGRI/Geolocation/lat"][i:i + ph, j:j + pw].astype(np.float32)
-                lon = f["AGRI/Geolocation/lon"][i:i + ph, j:j + pw].astype(np.float32)
-                # ele = f["AGRI/Aux/ELE"][i:i + ph, j:j + pw].astype(np.float32)
+                    BT = agri_patch.transpose(1, 2, 0)
+                    lat = geo_patch[0]
+                    lon = geo_patch[1]
+                    CLP, CER, COT, CTH = label_patch
+                else:
+                    bt_keys = sorted(f["AGRI/BT"].keys())
+                    bt_patches = [
+                        f[f"AGRI/BT/{k}"][i:i + ph, j:j + pw].astype(np.float32)
+                        for k in bt_keys
+                    ]
+                    BT = np.stack(bt_patches, axis=-1)
 
-                CLP = f["Labels/CLP"][i:i + ph, j:j + pw].astype(np.float32)
-                CER = f["Labels/CER"][i:i + ph, j:j + pw].astype(np.float32)
-                COT = f["Labels/COT"][i:i + ph, j:j + pw].astype(np.float32)
-                CTH = f["Labels/CTH"][i:i + ph, j:j + pw].astype(np.float32)
+                    lat = f["AGRI/Geolocation/lat"][i:i + ph, j:j + pw].astype(np.float32)
+                    lon = f["AGRI/Geolocation/lon"][i:i + ph, j:j + pw].astype(np.float32)
+
+                    CLP = f["Labels/CLP"][i:i + ph, j:j + pw].astype(np.float32)
+                    CER = f["Labels/CER"][i:i + ph, j:j + pw].astype(np.float32)
+                    COT = f["Labels/COT"][i:i + ph, j:j + pw].astype(np.float32)
+                    CTH = f["Labels/CTH"][i:i + ph, j:j + pw].astype(np.float32)
+            # with h5py.File(h5f, "r") as f:
+            #     bt_keys = sorted(f["AGRI/BT"].keys())
+            #     # Each channel is a 2-D (H, W) dataset; slice individually.
+            #     bt_patches = [
+            #         f[f"AGRI/BT/{k}"][i:i + ph, j:j + pw].astype(np.float32)
+            #         for k in bt_keys
+            #     ]
+            #     BT = np.stack(bt_patches, axis=-1)   # (ph, pw, C)
+            #
+            #     lat = f["AGRI/Geolocation/lat"][i:i + ph, j:j + pw].astype(np.float32)
+            #     lon = f["AGRI/Geolocation/lon"][i:i + ph, j:j + pw].astype(np.float32)
+            #     # ele = f["AGRI/Aux/ELE"][i:i + ph, j:j + pw].astype(np.float32)
+            #
+            #     CLP = f["Labels/CLP"][i:i + ph, j:j + pw].astype(np.float32)
+            #     CER = f["Labels/CER"][i:i + ph, j:j + pw].astype(np.float32)
+            #     COT = f["Labels/COT"][i:i + ph, j:j + pw].astype(np.float32)
+            #     CTH = f["Labels/CTH"][i:i + ph, j:j + pw].astype(np.float32)
 
         except Exception as exc:
             # Return a zero tensor on read failure (rare but resilient)

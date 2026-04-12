@@ -83,30 +83,67 @@ def _augment(agri: torch.Tensor, lbl: torch.Tensor):
 #
 #     total = loss_clp + loss_cer + loss_cot + loss_cth
 #     return total, loss_clp, loss_cer, loss_cot, loss_cth
+#
+# def _compute_losses(clp_logits, comp_out, labels, ce_loss_fn, reg_loss_fn):
+#     """
+#     labels: (B, 4, H, W)
+#     ch0=CLP, ch1-3=regression
+#     """
+#     # ---------- CLP classification ----------
+#     clp_raw = labels[:, 0, :, :]
+#     valid_clp = torch.isfinite(clp_raw) & (clp_raw >= 0) & (clp_raw < cfg.CLP_CLASSES)
+#
+#     clp_target = torch.where(
+#         valid_clp,
+#         clp_raw,
+#         torch.full_like(clp_raw, -100)
+#     ).long()
+#
+#     loss_clp = ce_loss_fn(clp_logits, clp_target) * cfg.LOSS_W_CLP
+#
+#     # ---------- regression masked loss ----------
+#     def masked_reg_loss(pred, target, weight):
+#         valid = torch.isfinite(target)
+#         if valid.any():
+#             return reg_loss_fn(pred[valid], target[valid]) * weight
+#         return pred.new_tensor(0.0)
+#
+#     loss_cer = masked_reg_loss(comp_out[:, 0], labels[:, 1], cfg.LOSS_W_CER)
+#     loss_cot = masked_reg_loss(comp_out[:, 1], labels[:, 2], cfg.LOSS_W_COT)
+#     loss_cth = masked_reg_loss(comp_out[:, 2], labels[:, 3], cfg.LOSS_W_CTH)
+#
+#     total = loss_clp + loss_cer + loss_cot + loss_cth
+#     return total, loss_clp, loss_cer, loss_cot, loss_cth
 
 def _compute_losses(clp_logits, comp_out, labels, ce_loss_fn, reg_loss_fn):
     """
     labels: (B, 4, H, W)
-    ch0=CLP, ch1-3=regression
+    ch0 = CLP
+    ch1-3 = normalised regression labels
+    NaN means invalid supervision
     """
-    # ---------- CLP classification ----------
+    zero = clp_logits.sum() * 0.0
+
+    # ---- CLP masked CE ----
     clp_raw = labels[:, 0, :, :]
     valid_clp = torch.isfinite(clp_raw) & (clp_raw >= 0) & (clp_raw < cfg.CLP_CLASSES)
 
-    clp_target = torch.where(
-        valid_clp,
-        clp_raw,
-        torch.full_like(clp_raw, -100)
-    ).long()
+    if valid_clp.any():
+        clp_target = torch.where(
+            valid_clp,
+            clp_raw,
+            torch.full_like(clp_raw, -100)
+        ).long()
+        loss_clp = ce_loss_fn(clp_logits, clp_target) * cfg.LOSS_W_CLP
+    else:
+        loss_clp = zero
 
-    loss_clp = ce_loss_fn(clp_logits, clp_target) * cfg.LOSS_W_CLP
-
-    # ---------- regression masked loss ----------
+    # ---- Regression masked loss ----
     def masked_reg_loss(pred, target, weight):
         valid = torch.isfinite(target)
         if valid.any():
             return reg_loss_fn(pred[valid], target[valid]) * weight
-        return pred.new_tensor(0.0)
+        return zero
 
     loss_cer = masked_reg_loss(comp_out[:, 0], labels[:, 1], cfg.LOSS_W_CER)
     loss_cot = masked_reg_loss(comp_out[:, 1], labels[:, 2], cfg.LOSS_W_COT)

@@ -31,7 +31,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Sequence, Dict, Any, List
+from typing import Optional, Sequence, Dict, Any, List, Tuple
 
 import h5py
 import numpy as np
@@ -580,12 +580,16 @@ def match_modis_to_agri(agri: dict, modis_list: list) -> Optional[dict]:
         best_ok[keep]   = cand_ok[better]
         best_dt[keep]   = m["_dt_min"]
         best_dist[keep] = dists[keep]
+        best_dt[~best_ok] = np.nan
+        best_dist[~best_ok] = np.nan
 
     return {
         "CLP": out["CLP"].reshape(H, W),
         "CER": out["CER"].reshape(H, W),
         "COT": out["COT"].reshape(H, W),
         "CTH": out["CTH"].reshape(H, W),
+        "MATCH_DT_MIN": best_dt.reshape(H, W),
+        "MATCH_DIST_KM": (best_dist.reshape(H, W) * 6371.0).astype(np.float32),
     }
 
 
@@ -627,129 +631,74 @@ def apply_quality_filter(agri: dict, labels: dict) -> dict:
     vza = agri["VZA"]
     sza = agri["SZA"]
 
-    # 先看几何量本身是不是有问题
-    log.info(
-        "geo stats | "
-        "VZA finite=%.2f%% min=%.2f max=%.2f | "
-        "SZA finite=%.2f%% min=%.2f max=%.2f",
-        100.0 * np.isfinite(vza).mean(),
-        np.nanmin(vza) if np.isfinite(vza).any() else np.nan,
-        np.nanmax(vza) if np.isfinite(vza).any() else np.nan,
-        100.0 * np.isfinite(sza).mean(),
-        np.nanmin(sza) if np.isfinite(sza).any() else np.nan,
-        np.nanmax(sza) if np.isfinite(sza).any() else np.nan,
-    )
-
+    geo_finite = np.isfinite(vza) & np.isfinite(sza)
     geo_ok = (
-        np.isfinite(vza) & np.isfinite(sza) &
+        geo_finite &
         (vza <= cfg.MAX_VZA_DEG) &
         (sza <= cfg.MAX_SZA_DEG)
     )
 
-    log.info(
-        "filter ratio | geo_ok=%d (%.2f%%) | vza_thr=%.2f | sza_thr=%.2f",
-        int(geo_ok.sum()),
-        100.0 * geo_ok.mean(),
-        cfg.MAX_VZA_DEG,
-        cfg.MAX_SZA_DEG,
-    )
-
-    # 1) 分类单独过滤
     clp_raw = labels["CLP"].copy()
+    cer_raw = labels["CER"].copy()
+    cot_raw = labels["COT"].copy()
+    cth_raw = labels["CTH"].copy()
 
+    # 1) CLP：只做类别范围过滤；默认不再强绑 geo_ok
     clp_ok = (
         np.isfinite(clp_raw) &
         (clp_raw >= 0) &
         (clp_raw < cfg.CLP_CLASSES)
     )
 
-    overlap_ok = geo_ok & clp_ok
+    clp_keep = clp_ok
+    if cfg.CLP_USE_GEO_FILTER:
+        clp_keep &= geo_ok
 
-    # 看 clp 有效区和 geo 有效区分别落在图上的哪里
-    hits_clp = np.where(clp_ok)
-    hits_geo = np.where(geo_ok)
-    hits_ovl = np.where(overlap_ok)
+    labels["CLP"] = np.where(clp_keep, clp_raw, np.nan)
 
-    if hits_clp[0].size > 0:
-        log.info(
-            "clp bbox | row=[%d,%d] col=[%d,%d]",
-            hits_clp[0].min(), hits_clp[0].max(),
-            hits_clp[1].min(), hits_clp[1].max(),
-        )
-
-    if hits_geo[0].size > 0:
-        log.info(
-            "geo bbox | row=[%d,%d] col=[%d,%d]",
-            hits_geo[0].min(), hits_geo[0].max(),
-            hits_geo[1].min(), hits_geo[1].max(),
-        )
-
-    if hits_ovl[0].size > 0:
-        log.info(
-            "overlap bbox | row=[%d,%d] col=[%d,%d]",
-            hits_ovl[0].min(), hits_ovl[0].max(),
-            hits_ovl[1].min(), hits_ovl[1].max(),
-        )
-    else:
-        log.info("overlap bbox | empty")
-
-    clear_raw = np.isfinite(clp_raw) & (clp_raw == 0)
-    cloudy_raw = np.isfinite(clp_raw) & (clp_raw > 0)
-
-    log.info(
-        "clp before qc | finite=%d | valid_range=%d | clear=%d | cloudy=%d | overlap_geo=%d",
-        int(np.isfinite(clp_raw).sum()),
-        int(clp_ok.sum()),
-        int(clear_raw.sum()),
-        int(cloudy_raw.sum()),
-        int(overlap_ok.sum()),
-    )
-
-    # 如果 overlap 很低，基本说明“匹配到了，但几乎都落在 geo_ok 外”
-    if clp_ok.sum() > 0:
-        log.info(
-            "clp overlap ratio | overlap/valid_range=%.2f%% | overlap/all_pixels=%.2f%%",
-            100.0 * overlap_ok.sum() / clp_ok.sum(),
-            100.0 * overlap_ok.mean(),
-        )
-
-    labels["CLP"] = np.where(overlap_ok, clp_raw, np.nan)
-
-    log.info(
-        "clp after qc | finite=%d | clear=%d | cloudy=%d",
-        int(np.isfinite(labels["CLP"]).sum()),
-        int((np.isfinite(labels["CLP"]) & (labels["CLP"] == 0)).sum()),
-        int((np.isfinite(labels["CLP"]) & (labels["CLP"] > 0)).sum()),
-    )
-
-    # 2) 回归各自单独过滤
+    # 2) 回归：只在“有云且本变量本身有效”的位置保留
     cloudy = np.isfinite(labels["CLP"]) & (labels["CLP"] > 0)
-
-    cer_raw = labels["CER"].copy()
-    cot_raw = labels["COT"].copy()
-    cth_raw = labels["CTH"].copy()
 
     cer_ok = cloudy & np.isfinite(cer_raw) & (cer_raw >= 0) & (cer_raw <= 100)
     cot_ok = cloudy & np.isfinite(cot_raw) & (cot_raw >= 0) & (cot_raw <= 200)
     cth_ok = cloudy & np.isfinite(cth_raw) & (cth_raw >= 0) & (cth_raw <= 25000)
 
-    log.info(
-        "reg before qc | CER=%d | COT=%d | CTH=%d | cloudy_mask=%d",
-        int(np.isfinite(cer_raw).sum()),
-        int(np.isfinite(cot_raw).sum()),
-        int(np.isfinite(cth_raw).sum()),
-        int(cloudy.sum()),
-    )
+    if cfg.REG_USE_GEO_FILTER:
+        cer_ok &= geo_ok
+        cot_ok &= geo_ok
+        cth_ok &= geo_ok
 
     labels["CER"] = np.where(cer_ok, cer_raw, np.nan)
     labels["COT"] = np.where(cot_ok, cot_raw, np.nan)
     labels["CTH"] = np.where(cth_ok, cth_raw, np.nan)
 
+    if "MATCH_DT_MIN" in labels:
+        labels["MATCH_DT_MIN"] = np.where(
+            np.isfinite(labels["CLP"]),
+            labels["MATCH_DT_MIN"],
+            np.nan,
+        )
+
+    if "MATCH_DIST_KM" in labels:
+        labels["MATCH_DIST_KM"] = np.where(
+            np.isfinite(labels["CLP"]),
+            labels["MATCH_DIST_KM"],
+            np.nan,
+        )
+
+    # 3) 无云/无标签像元，不参与回归监督
+    clear_or_invalid = ~cloudy
+    for k in ["CER", "COT", "CTH"]:
+        labels[k][clear_or_invalid] = np.nan
+
+    # 只保留一条摘要日志
     log.info(
-        "reg after qc | CER=%d | COT=%d | CTH=%d",
+        "qc | clp=%d cer=%d cot=%d cth=%d | clp_ratio=%.2f%%",
+        int(np.isfinite(labels["CLP"]).sum()),
         int(np.isfinite(labels["CER"]).sum()),
         int(np.isfinite(labels["COT"]).sum()),
         int(np.isfinite(labels["CTH"]).sum()),
+        100.0 * np.isfinite(labels["CLP"]).mean(),
     )
 
     return labels
@@ -758,6 +707,265 @@ def apply_quality_filter(agri: dict, labels: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # HDF5 writer
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _infer_split_from_dir(out_dir: Path) -> str:
+    parts = {p.lower() for p in out_dir.parts}
+    if "train" in parts:
+        return "train"
+    if "val" in parts or "valid" in parts or "validation" in parts:
+        return "val"
+    if "test" in parts:
+        return "test"
+    return "train"
+
+
+def _sample_thresholds(mode: str, patch_size: Tuple[int, int]) -> Tuple[int, int]:
+    ph, pw = patch_size
+    min_clp_valid = max(cfg.MIN_PATCH_LABEL_PIXELS, int(ph * pw * 0.05))
+    min_cloudy_valid = max(cfg.MIN_TRAIN_CLOUDY_LABEL_PIXELS, int(ph * pw * 0.05))
+    if mode == "train":
+        return min_clp_valid, min_cloudy_valid
+    return min_clp_valid, 0
+
+
+def _iter_supervised_patch_positions(
+    labels: dict,
+    patch_size: Tuple[int, int],
+    mode: str
+) -> List[Tuple[int, int, int, int]]:
+    ph, pw = patch_size
+    clp = labels["CLP"]
+    cer = labels["CER"]
+    cot = labels["COT"]
+    cth = labels["CTH"]
+    H, W = clp.shape
+
+    if mode == "train":
+        sh, sw = max(1, ph // 2), max(1, pw // 2)
+    else:
+        sh, sw = ph, pw
+
+    min_clp_valid, min_cloudy_valid = _sample_thresholds(mode, patch_size)
+
+    h_positions = list(range(0, H - ph + 1, sh))
+    if h_positions and h_positions[-1] != H - ph:
+        h_positions.append(H - ph)
+
+    w_positions = list(range(0, W - pw + 1, sw))
+    if w_positions and w_positions[-1] != W - pw:
+        w_positions.append(W - pw)
+
+    positions: List[Tuple[int, int, int, int]] = []
+    for i in h_positions:
+        for j in w_positions:
+            patch_clp = clp[i:i + ph, j:j + pw]
+            patch_cer = cer[i:i + ph, j:j + pw]
+            patch_cot = cot[i:i + ph, j:j + pw]
+            patch_cth = cth[i:i + ph, j:j + pw]
+
+            clp_valid = np.isfinite(patch_clp)
+            n_clp_valid = int(clp_valid.sum())
+            if n_clp_valid < min_clp_valid:
+                continue
+
+            cloudy_valid = (
+                clp_valid &
+                (patch_clp > 0) &
+                np.isfinite(patch_cer) &
+                np.isfinite(patch_cot) &
+                np.isfinite(patch_cth)
+            )
+            n_cloudy_valid = int(cloudy_valid.sum())
+            if mode == "train" and n_cloudy_valid < min_cloudy_valid:
+                continue
+
+            positions.append((i, j, n_clp_valid, n_cloudy_valid))
+
+    return positions
+
+
+def _create_resizable_dataset(
+    group: h5py.Group,
+    name: str,
+    shape_tail: Tuple[int, ...],
+    dtype=np.float32
+):
+    return group.create_dataset(
+        name,
+        shape=(0,) + shape_tail,
+        maxshape=(None,) + shape_tail,
+        dtype=dtype,
+        compression="gzip",
+        compression_opts=4,
+        chunks=(1,) + shape_tail,
+    )
+
+
+def _append_dataset(ds: h5py.Dataset, value: np.ndarray) -> None:
+    n = ds.shape[0]
+    ds.resize((n + 1,) + ds.shape[1:])
+    ds[n] = value
+
+
+def write_supervised_samples_temp_hdf5(
+    temp_path: Path,
+    agri: dict,
+    labels: dict,
+    agri_dt: datetime,
+    mode: str,
+) -> int:
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    patch_size = tuple(cfg.PATCH_SIZE)
+    positions = _iter_supervised_patch_positions(labels, patch_size, mode)
+    if not positions:
+        raise RuntimeError(f"No supervised samples extracted for {agri_dt:%Y%m%d_%H%M%S}")
+
+    ph, pw = patch_size
+    C = agri["BT"].shape[-1]
+
+    with h5py.File(temp_path, "w") as f:
+        f.attrs["format"] = "samples_v1"
+        f.attrs["agri_datetime"] = agri_dt.strftime("%Y%m%d%H%M%S")
+        f.attrs["agri_channels"] = cfg.AGRI_BT_CHANNEL_INDICES
+        f.attrs["patch_size"] = list(cfg.PATCH_SIZE)
+        f.attrs["source_scene_shape"] = list(agri["lat"].shape)
+        f.attrs["split_mode"] = mode
+        f.attrs["max_time_diff_min"] = float(cfg.MAX_TIME_DIFF_MIN)
+        f.attrs["max_match_dist_km"] = float(cfg.MAX_MATCH_DIST_KM)
+
+        samples = f.create_group("Samples")
+        agri_ds = _create_resizable_dataset(samples, "agri", (C, ph, pw), dtype=np.float32)
+        geo_ds = _create_resizable_dataset(samples, "geo", (4, ph, pw), dtype=np.float32)
+        label_ds = _create_resizable_dataset(samples, "labels", (4, ph, pw), dtype=np.float32)
+        row_ds = _create_resizable_dataset(samples, "row", tuple(), dtype=np.int32)
+        col_ds = _create_resizable_dataset(samples, "col", tuple(), dtype=np.int32)
+        clp_px_ds = _create_resizable_dataset(samples, "valid_clp_pixels", tuple(), dtype=np.int32)
+        cloudy_px_ds = _create_resizable_dataset(samples, "valid_cloudy_pixels", tuple(), dtype=np.int32)
+        dt_ds = _create_resizable_dataset(samples, "max_time_diff_min", tuple(), dtype=np.float32)
+        dist_ds = _create_resizable_dataset(samples, "max_match_dist_km", tuple(), dtype=np.float32)
+
+        for i, j, n_clp_valid, n_cloudy_valid in positions:
+            agri_patch = agri["BT"][i:i + ph, j:j + pw, :].transpose(2, 0, 1).astype(np.float32)
+            geo_patch = np.stack([
+                agri["lat"][i:i + ph, j:j + pw],
+                agri["lon"][i:i + ph, j:j + pw],
+                agri["VZA"][i:i + ph, j:j + pw],
+                agri["SZA"][i:i + ph, j:j + pw],
+            ], axis=0).astype(np.float32)
+            label_patch = np.stack([
+                labels["CLP"][i:i + ph, j:j + pw],
+                labels["CER"][i:i + ph, j:j + pw],
+                labels["COT"][i:i + ph, j:j + pw],
+                labels["CTH"][i:i + ph, j:j + pw],
+            ], axis=0).astype(np.float32)
+
+            match_dt_patch = labels.get("MATCH_DT_MIN")
+            match_dist_patch = labels.get("MATCH_DIST_KM")
+            clp_valid = np.isfinite(label_patch[0])
+
+            sample_max_dt = np.nan
+            sample_max_dist = np.nan
+            if match_dt_patch is not None and np.any(clp_valid):
+                sample_max_dt = np.nanmax(match_dt_patch[i:i + ph, j:j + pw][clp_valid])
+            if match_dist_patch is not None and np.any(clp_valid):
+                sample_max_dist = np.nanmax(match_dist_patch[i:i + ph, j:j + pw][clp_valid])
+
+            _append_dataset(agri_ds, agri_patch)
+            _append_dataset(geo_ds, geo_patch)
+            _append_dataset(label_ds, label_patch)
+            _append_dataset(row_ds, np.asarray(i, dtype=np.int32))
+            _append_dataset(col_ds, np.asarray(j, dtype=np.int32))
+            _append_dataset(clp_px_ds, np.asarray(n_clp_valid, dtype=np.int32))
+            _append_dataset(cloudy_px_ds, np.asarray(n_cloudy_valid, dtype=np.int32))
+            _append_dataset(dt_ds, np.asarray(sample_max_dt, dtype=np.float32))
+            _append_dataset(dist_ds, np.asarray(sample_max_dist, dtype=np.float32))
+
+        f.attrs["num_samples"] = int(agri_ds.shape[0])
+
+    log.info("Wrote temp supervised HDF5 %s with %d samples", temp_path.name, len(positions))
+    return len(positions)
+
+
+def validate_temp_supervised_hdf5(temp_path: Path, agri_dt: datetime, mode: str) -> None:
+    min_clp_valid, min_cloudy_valid = _sample_thresholds(mode, tuple(cfg.PATCH_SIZE))
+
+    with h5py.File(temp_path, "r") as f:
+        if f.attrs.get("format", "") != "samples_v1":
+            raise ValueError(f"Unexpected temp HDF5 format in {temp_path}")
+        if f.attrs.get("agri_datetime", "") != agri_dt.strftime("%Y%m%d%H%M%S"):
+            raise ValueError(f"Datetime mismatch in {temp_path}")
+
+        samples = f["Samples"]
+        n = int(samples["agri"].shape[0])
+        if n <= 0:
+            raise ValueError(f"No samples stored in {temp_path}")
+
+        if not (samples["labels"].shape[0] == samples["geo"].shape[0] == n):
+            raise ValueError(f"Inconsistent sample counts in {temp_path}")
+
+        clp_valid = np.isfinite(samples["labels"][:, 0]).sum(axis=(1, 2))
+        if np.any(clp_valid < min_clp_valid):
+            raise ValueError(f"Found sample with insufficient CLP supervision in {temp_path}")
+
+        if mode == "train":
+            cloudy_valid = samples["valid_cloudy_pixels"][()]
+            if np.any(cloudy_valid < min_cloudy_valid):
+                raise ValueError(
+                    f"Found train sample with insufficient cloudy regression supervision in {temp_path}"
+                )
+
+        dt = samples["max_time_diff_min"][()]
+        dt = dt[np.isfinite(dt)]
+        if dt.size and float(np.nanmax(dt)) > float(cfg.MAX_TIME_DIFF_MIN) + 1e-6:
+            raise ValueError(f"Time lag exceeds cfg.MAX_TIME_DIFF_MIN in {temp_path}")
+
+        dist = samples["max_match_dist_km"][()]
+        dist = dist[np.isfinite(dist)]
+        if dist.size and float(np.nanmax(dist)) > float(cfg.MAX_MATCH_DIST_KM) + 1e-6:
+            raise ValueError(f"Spatial match distance exceeds cfg.MAX_MATCH_DIST_KM in {temp_path}")
+
+
+def _copy_h5_group(src: h5py.Group, dst: h5py.Group) -> None:
+    for key, value in src.attrs.items():
+        dst.attrs[key] = value
+    for name, item in src.items():
+        if isinstance(item, h5py.Dataset):
+            src.copy(name, dst, name=name)
+        else:
+            child = dst.create_group(name)
+            _copy_h5_group(item, child)
+
+
+def finalize_temp_hdf5(temp_path: Path, final_path: Path) -> None:
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(temp_path, "r") as src, h5py.File(final_path, "w") as dst:
+        _copy_h5_group(src, dst)
+    temp_path.unlink(missing_ok=True)
+    log.info("Finalised %s from validated temp file", final_path.name)
+
+
+def safe_write_supervised_hdf5(
+    out_path: Path,
+    agri: dict,
+    labels: dict,
+    agri_dt: datetime,
+    mode: str
+) -> int:
+    temp_path = out_path.with_name(out_path.stem + cfg.TEMP_H5_SUFFIX)
+    if temp_path.exists():
+        temp_path.unlink()
+
+    try:
+        n_samples = write_supervised_samples_temp_hdf5(
+            temp_path, agri, labels, agri_dt, mode
+        )
+        validate_temp_supervised_hdf5(temp_path, agri_dt, mode)
+        finalize_temp_hdf5(temp_path, out_path)
+        return n_samples
+    except Exception:
+        if temp_path.exists() and not cfg.KEEP_TEMP_H5_ON_ERROR:
+            temp_path.unlink()
+        raise
 
 def write_paired_hdf5(out_path: Path, agri: dict, labels: dict, agri_dt: datetime):
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,9 +990,13 @@ def write_paired_hdf5(out_path: Path, agri: dict, labels: dict, agri_dt: datetim
                 compression="gzip", compression_opts=4
             )
 
+        # lbl = f.create_group("Labels")
+        # for k, v in labels.items():
+        #     lbl.create_dataset(k, data=v, compression="gzip", compression_opts=4)
+
         lbl = f.create_group("Labels")
-        for k, v in labels.items():
-            lbl.create_dataset(k, data=v, compression="gzip", compression_opts=4)
+        for k in ["CLP", "CER", "COT", "CTH"]:
+            lbl.create_dataset(k, data=labels[k], compression="gzip", compression_opts=4)
 
     log.debug("Wrote %s", out_path)
 
@@ -1117,7 +1329,20 @@ def fuse_day(
             log.debug("Too few valid pixels (%d) for %s – skipping", valid_px, agri_file.name)
             continue
 
-        write_paired_hdf5(out_path, agri, labels, agri_dt)
+        # write_paired_hdf5(out_path, agri, labels, agri_dt)
+        # paired_count += 1
+
+        mode = _infer_split_from_dir(out_dir)
+        try:
+            if cfg.FUSION_OUTPUT_MODE == "samples_only":
+                n_samples = safe_write_supervised_hdf5(out_path, agri, labels, agri_dt, mode)
+                log.info("final supervised samples | n=%d | file=%s", n_samples, out_path.name)
+            else:
+                write_paired_hdf5(out_path, agri, labels, agri_dt)
+        except Exception as exc:
+            log.error("Failed to write fused output for %s: %s", agri_file.name, exc)
+            continue
+
         paired_count += 1
 
         # ── QC figure ─────────────────────────────────────────────────────
