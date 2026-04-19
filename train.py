@@ -154,15 +154,8 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
         agri   = agri.to(device)
         labels = labels.to(device)
 
-        if training:
-            agri, labels = _augment(agri, labels)
-
-        # if training and torch.rand(1).item() < 0.001:
-        #     clp = labels[:, 0]
-        #     print("CLP finite:", torch.isfinite(clp).sum().item(), "/", clp.numel())
-        #     print("CLP min/max(valid):",
-        #           clp[torch.isfinite(clp)].min().item() if torch.isfinite(clp).any() else None,
-        #           clp[torch.isfinite(clp)].max().item() if torch.isfinite(clp).any() else None)
+        # if training:
+        #     agri, labels = _augment(agri, labels)
 
         with autocast(enabled=(scaler is not None)):
             clp_logits, comp_out = model(agri)

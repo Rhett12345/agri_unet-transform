@@ -52,7 +52,7 @@ RETRIEVAL_DIR = ROOT / "retrieval"
 # AGRI FDI – selected channel indices to use (0-based in the sorted list)
 # 当前输入为：ch2(0.65µm) + ch5(1.61µm) + ch8-14(IR)
 # 保留变量名 AGRI_BT_CHANNEL_INDICES 以兼容现有训练/推理代码。
-AGRI_BT_CHANNEL_INDICES = [1, 4, 7, 8, 9, 10, 11, 12, 13]   # 9 channels of FY4A
+AGRI_BT_CHANNEL_INDICES = [1, 4, 8, 9, 10, 11, 12, 13]   # 9 channels of FY4A
 
 # AGRI pixel size in degrees (approx) for spatial matching
 AGRI_PIXEL_DEG = 0.04
@@ -92,7 +92,7 @@ MODIS_OPTICAL_PHASE_MAP = {0: -1, 1: 0, 2: 1, 3: 4, 4: -1}
 MAX_MATCH_DIST_KM = 3.0
 
 # Maximum time difference (minutes) between AGRI scan and MYD06 granule
-MAX_TIME_DIFF_MIN = 15
+MAX_TIME_DIFF_MIN = 5
 
 # Angle filters
 MAX_VZA_DEG = 65
@@ -201,8 +201,8 @@ GIIRS_CHANNELS = 0                               # not used
 CLP_CLASSES   = 5
 COMP_CHANNELS = 3   # CER, COT, CTH
 
-MODEL_BASE_CHANNELS = 16
-TRANSFORMER_DEPTH   = 2
+MODEL_BASE_CHANNELS = 32
+TRANSFORMER_DEPTH   = 4
 TRANSFORMER_HEADS   = 8
 TRANSFORMER_MLP_DIM = 256
 
@@ -210,9 +210,9 @@ TRANSFORMER_MLP_DIM = 256
 # 9.  Training hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
 BATCH_SIZE    = 32
-NUM_EPOCHS    = 50        # 原来 10，参考代码用 50，10 epoch 模型远未收敛
+NUM_EPOCHS    = 50
 LEARNING_RATE = 1e-4
-LR_PATIENCE   = 8         # 原来 5，给模型更多时间跨越平台期再降 LR
+LR_PATIENCE   = 12
 LR_FACTOR     = 0.5
 MIN_LR        = 1e-6
 GRAD_CLIP     = 1.0
