@@ -15,6 +15,10 @@ TIME_HIGH_Q_MIN   = float(os.environ.get("FUSION_TIME_HIGH_Q_MIN",   "5.0"))   #
 TIME_LOW_Q_MIN    = float(os.environ.get("FUSION_TIME_LOW_Q_MIN",    "7.5"))   # 5~7.5：降权; >7.5 丢弃
 SCAN_TIME_FALLBACK_WEIGHT = float(os.environ.get("FUSION_SCAN_TIME_FALLBACK_WEIGHT", "0.7"))
 # 当无法获取像元级 scan_time 时，文件名时间作 fallback，权重乘以此系数
+REQUIRE_MYD03_1KM = os.environ.get("FUSION_REQUIRE_MYD03_1KM", "1") == "1"
+# 严格融合默认要求 MYD03 1km geolocation，避免静默退回 MYD06 5km 经纬度重复上采样。
+REQUIRE_SCAN_TIME = os.environ.get("FUSION_REQUIRE_SCAN_TIME", "1") == "1"
+# 严格融合默认要求逐扫描/像元时间，避免 MATCH_DT_MIN 退化为文件名级时间差。
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 空间聚合参数
@@ -38,6 +42,12 @@ PHASE_CONSISTENCY_MIN   = float(os.environ.get("FUSION_PHASE_CONSISTENCY_MIN", "
 # 纯云模式开关：仅保留 cloud_fraction > PURE_CLOUD_FRAC 的 COT/CER 标签
 PURE_CLOUD_ONLY         = os.environ.get("FUSION_PURE_CLOUD_ONLY", "0") == "1"
 PURE_CLOUD_FRAC         = float(os.environ.get("FUSION_PURE_CLOUD_FRAC",       "0.9"))
+
+# 回归标签最终门控比 CLP 更严格；分类可保留边界/clear 样本，CER/COT/CTH 宁可少而准。
+REG_TIME_MAX_MIN        = float(os.environ.get("FUSION_REG_TIME_MAX_MIN",        "2.0"))
+REG_OVERLAP_FRAC_MIN    = float(os.environ.get("FUSION_REG_OVERLAP_FRAC_MIN",    str(OVERLAP_FRAC_MIN)))
+REG_CLOUD_FRAC_MIN      = float(os.environ.get("FUSION_REG_CLOUD_FRAC_MIN",      str(CLOUD_FRAC_MIN_CLOUDY)))
+REG_PHASE_CONSISTENCY_MIN = float(os.environ.get("FUSION_REG_PHASE_CONSISTENCY_MIN", "0.8"))
 
 # COT 对数域 epsilon（避免 log(0)）
 COT_LOG_EPS             = 1e-3
@@ -63,3 +73,10 @@ N_FUSION_WORKERS = int(_os.environ.get("FUSION_N_WORKERS",
 # 调试 / 日志
 # ─────────────────────────────────────────────────────────────────────────────
 FUSION_LOG_PIXEL_STATS  = os.environ.get("FUSION_LOG_PIXEL_STATS", "1") == "1"
+
+_qc_diag_raw = os.environ.get(
+    "ENABLE_QC_DIAGNOSTICS",
+    os.environ.get("FUSION_ENABLE_QC_DIAGNOSTICS", "0"),
+)
+ENABLE_QC_DIAGNOSTICS = _qc_diag_raw.strip().lower() in {"1", "true", "yes", "on"}
+QC_DIAGNOSTICS_DIR = os.environ.get("FUSION_QC_DIAGNOSTICS_DIR", "runs/qc_diagnostics")

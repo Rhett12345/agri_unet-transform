@@ -22,7 +22,7 @@ AGRI + MYD06 融合流水线的顶层调度器。
   python data_fusion.py --split train --workers 8
 """
 from __future__ import annotations
-import argparse, logging, sys, traceback
+import argparse, csv, json, logging, sys, traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -46,22 +46,82 @@ log = logging.getLogger(__name__)
 _find_day_folders = find_day_folders
 
 
-def _fuse_one_scene(agri_file, modis_files, out_path, mode):
+QC_DIAGNOSTIC_FIELDS = [
+    "scene_id", "agri_file", "myd06_file", "myd03_file",
+    "raw_clp_valid_px", "raw_cer_valid_px", "raw_cot_valid_px", "raw_cth_valid_px",
+    "time_ok_px", "overlap_ok_px", "geo_ok_px", "phase_ok_px",
+    "reg_time_ok_px", "reg_overlap_ok_px", "reg_cloud_ok_px", "reg_phase_ok_px",
+    "cumulative_base_px", "cumulative_after_time_px", "cumulative_after_overlap_px",
+    "cumulative_after_geo_px", "cumulative_after_phase_px",
+    "cumulative_after_reg_time_px", "cumulative_after_reg_overlap_px",
+    "cumulative_after_reg_cloud_px", "cumulative_after_reg_phase_px",
+    "final_clp_px", "final_cer_px", "final_cot_px", "final_cth_px",
+    "time_delta_min_p50", "time_delta_min_p90", "time_delta_min_max",
+    "overlap_ratio", "cloud_frac", "phase_consistency",
+]
+
+
+def _json_safe(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _reset_qc_diagnostics(out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in ["qc_gate_stats.csv", "qc_gate_stats.jsonl"]:
+        path = out_dir / name
+        if path.exists():
+            path.unlink()
+
+
+def _write_qc_diagnostics(rows, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "qc_gate_stats.csv"
+    jsonl_path = out_dir / "qc_gate_stats.jsonl"
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=QC_DIAGNOSTIC_FIELDS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _json_safe(row.get(k)) for k in QC_DIAGNOSTIC_FIELDS})
+    with jsonl_path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            payload = {k: _json_safe(row.get(k)) for k in QC_DIAGNOSTIC_FIELDS}
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    log.info("QC diagnostics saved -> %s and %s", csv_path, jsonl_path)
+
+
+def _unpack_scene_result(result):
+    if len(result) == 3:
+        ok, op, msg = result
+        return ok, op, msg, None
+    ok, op, msg, diag = result
+    return ok, op, msg, diag
+
+
+def _fuse_one_scene(agri_file, modis_files, out_path, mode, qc_diagnostics_enabled=False):
     """子进程任务：融合单个 AGRI 场景，返回 (ok, out_path, msg)。"""
     logging.basicConfig(level=logging.WARNING,
                         format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
     agri_path = Path(agri_file)
     out = Path(out_path)
+    diag_row = None
     try:
         agri_dt = parse_agri_datetime(agri_path.name)
         if agri_dt is None:
-            return False, out_path, "Cannot parse AGRI datetime"
+            return False, out_path, "Cannot parse AGRI datetime", diag_row
 
         agri = read_agri_scene(agri_path)
         if agri is None:
-            return False, out_path, "read_agri_scene None"
+            return False, out_path, "read_agri_scene None", diag_row
 
         modis_list = []
+        myd06_names = []
+        myd03_names = []
         for item in modis_files:
             if isinstance(item, (list, tuple)):
                 mf = Path(item[0])
@@ -69,6 +129,9 @@ def _fuse_one_scene(agri_file, modis_files, out_path, mode):
             else:
                 mf = Path(item)
                 myd03_file = None
+            myd06_names.append(mf.name)
+            if myd03_file is not None:
+                myd03_names.append(myd03_file.name)
             m = read_myd06(mf, agri_dt=agri_dt, myd03_file=myd03_file)
             if m is None:
                 continue
@@ -80,12 +143,21 @@ def _fuse_one_scene(agri_file, modis_files, out_path, mode):
             modis_list.append(m)
 
         if not modis_list:
-            return False, out_path, "No MYD06 after reading"
+            return False, out_path, "No MYD06 after reading", diag_row
         labels = aggregate_modis_to_agri(agri["lat"], agri["lon"], modis_list)
         if labels is None:
-            return False, out_path, "aggregate returned None"
+            return False, out_path, "aggregate returned None", diag_row
 
-        labels = apply_quality_filter(agri, labels)
+        diagnostics = None
+        if qc_diagnostics_enabled:
+            diagnostics = {
+                "scene_id": agri_dt.strftime("%Y%m%d_%H%M%S"),
+                "agri_file": agri_path.name,
+                "myd06_file": ";".join(myd06_names) if myd06_names else None,
+                "myd03_file": ";".join(myd03_names) if myd03_names else None,
+            }
+        labels = apply_quality_filter(agri, labels, diagnostics=diagnostics)
+        diag_row = diagnostics.get("row") if diagnostics is not None else None
 
         thresh = get_patch_supervision_thresholds(mode, tuple(cfg.PATCH_SIZE))
         n_clp = int(np.isfinite(labels["CLP"]).sum())
@@ -99,18 +171,18 @@ def _fuse_one_scene(agri_file, modis_files, out_path, mode):
             return False, out_path, (
                 f"Too few: clp={n_clp}/{thresh['min_valid_label_pixels']} "
                 f"cld={n_cld}/{thresh['min_valid_cloudy_pixels']}"
-            )
+            ), diag_row
 
         out.parent.mkdir(parents=True, exist_ok=True)
         if cfg.FUSION_OUTPUT_MODE == "samples_only":
             n_s = write_fused_samples(out, agri, labels, agri_dt, mode)
-            return True, out_path, f"OK samples={n_s}"
+            return True, out_path, f"OK samples={n_s}", diag_row
         else:
             write_full_disk_hdf5(out, agri, labels, agri_dt)
-            return True, out_path, "OK full_disk"
+            return True, out_path, "OK full_disk", diag_row
 
     except Exception:
-        return False, out_path, f"Exception:\n{traceback.format_exc()}"
+        return False, out_path, f"Exception:\n{traceback.format_exc()}", diag_row
 
 
 def _make_qc_figure(out_h5: Path, qc_path: Path):
@@ -213,6 +285,8 @@ def fuse_day(
     overwrite: bool = False,
     max_qc: int = 3,
     n_workers: int = fc.N_FUSION_WORKERS,
+    enable_qc_diagnostics: bool = fc.ENABLE_QC_DIAGNOSTICS,
+    qc_diagnostics_dir: Path = Path(fc.QC_DIAGNOSTICS_DIR),
 ) -> int:
     agri_files = sorted([
         p for p in list(agri_day_dir.glob("*.HDF")) + list(agri_day_dir.glob("*.hdf"))
@@ -247,7 +321,7 @@ def fuse_day(
         out_path = out_dir / out_name
         if out_path.exists() and not overwrite:
             continue
-        tasks.append((str(agri_file), matched, str(out_path), mode))
+        tasks.append((str(agri_file), matched, str(out_path), mode, bool(enable_qc_diagnostics)))
 
     if not tasks:
         log.info("Day %s - no tasks", agri_day_dir.name)
@@ -255,10 +329,13 @@ def fuse_day(
 
     log.info("Day %s - submitting %d tasks", agri_day_dir.name, len(tasks))
     success, qc_count = 0, 0
+    diagnostic_rows = []
 
     if n_workers <= 1:
         for args in tasks:
-            ok, op, msg = _fuse_one_scene(*args)
+            ok, op, msg, diag = _unpack_scene_result(_fuse_one_scene(*args))
+            if diag is not None:
+                diagnostic_rows.append(diag)
             if ok:
                 success += 1
                 if qc_count < max_qc:
@@ -272,9 +349,11 @@ def fuse_day(
             for fut in as_completed(futures):
                 task = futures[fut]
                 try:
-                    ok, op, msg = fut.result()
+                    ok, op, msg, diag = _unpack_scene_result(fut.result())
                 except Exception as exc:
-                    ok, op, msg = False, task[2], str(exc)
+                    ok, op, msg, diag = False, task[2], str(exc), None
+                if diag is not None:
+                    diagnostic_rows.append(diag)
                 if ok:
                     success += 1
                     if qc_count < max_qc:
@@ -284,6 +363,8 @@ def fuse_day(
                     log.debug("Skip %s: %s", Path(task[2]).name, msg[:200])
 
     log.info("Day %s - %d/%d ok | %d QC figs", agri_day_dir.name, success, len(tasks), qc_count)
+    if enable_qc_diagnostics:
+        _write_qc_diagnostics(diagnostic_rows, Path(qc_diagnostics_dir))
     return success
 
 
@@ -313,6 +394,8 @@ def main():
     parser.add_argument("--overwrite",action="store_true")
     parser.add_argument("--max_qc",  type=int, default=3)
     parser.add_argument("--workers", type=int, default=fc.N_FUSION_WORKERS)
+    parser.add_argument("--enable-qc-diagnostics", action="store_true", default=None)
+    parser.add_argument("--qc-diagnostics-dir", default=fc.QC_DIAGNOSTICS_DIR)
     args = parser.parse_args()
 
     split_out  = {"train":cfg.PAIRED_TRAIN_DIR,"val":cfg.PAIRED_VAL_DIR,"test":cfg.PAIRED_TEST_DIR}[args.split]
@@ -325,6 +408,14 @@ def main():
     myd03_days = {d.name: d for d in find_day_folders(cfg.MYD03_ROOT, dates)}
 
     total = 0
+    qc_diag_enabled = (
+        fc.ENABLE_QC_DIAGNOSTICS
+        if args.enable_qc_diagnostics is None
+        else args.enable_qc_diagnostics
+    )
+    qc_diag_dir = Path(args.qc_diagnostics_dir)
+    if qc_diag_enabled:
+        _reset_qc_diagnostics(qc_diag_dir)
     for agri_day in agri_days:
         modis_day = modis_days.get(agri_day.name)
         if modis_day is None:
@@ -336,7 +427,9 @@ def main():
         total += fuse_day(agri_day, modis_day, split_out / agri_day.name,
                           myd03_day_dir=myd03_day,
                           mode=args.split, overwrite=args.overwrite,
-                          max_qc=args.max_qc, n_workers=args.workers)
+                          max_qc=args.max_qc, n_workers=args.workers,
+                          enable_qc_diagnostics=qc_diag_enabled,
+                          qc_diagnostics_dir=qc_diag_dir)
 
     log.info("Fusion done - %d files total", total)
 

@@ -49,6 +49,7 @@ def stage_fuse(args):
     """调用新的多进程融合引擎。"""
     import fusion_config as fc
     from data_fusion import _find_day_folders, fuse_day
+    from data_fusion import _reset_qc_diagnostics
 
     split_out = {
         "train": cfg.PAIRED_TRAIN_DIR,
@@ -64,6 +65,13 @@ def stage_fuse(args):
     split = getattr(args, "split", "train")
     dates = [args.day] if getattr(args, "day", None) else split_dates[split]
     n_workers = getattr(args, "workers", fc.N_FUSION_WORKERS)
+    qc_diag_enabled = bool(
+        getattr(args, "enable_qc_diagnostics", False)
+        or getattr(fc, "ENABLE_QC_DIAGNOSTICS", False)
+    )
+    qc_diag_dir = Path(getattr(args, "qc_diagnostics_dir", None) or fc.QC_DIAGNOSTICS_DIR)
+    if qc_diag_enabled:
+        _reset_qc_diagnostics(qc_diag_dir)
 
     agri_days  = _find_day_folders(cfg.AGRI_ROOT, dates)
     modis_days = {d.name: d for d in _find_day_folders(cfg.MODIS_ROOT, dates)}
@@ -87,6 +95,8 @@ def stage_fuse(args):
             overwrite=getattr(args, "overwrite", False),
             max_qc=getattr(args, "max_qc", 3),
             n_workers=n_workers,
+            enable_qc_diagnostics=qc_diag_enabled,
+            qc_diagnostics_dir=qc_diag_dir,
         )
 
 
@@ -168,6 +178,10 @@ def parse_args():
     p.add_argument("--max_qc",     type=int, default=3)
     p.add_argument("--workers",    type=int, default=None,
                    help="融合并行进程数（默认 CPU-1）")
+    p.add_argument("--enable-qc-diagnostics", action="store_true",
+                   help="输出每个 scene 的融合 QC gate 诊断 CSV/JSONL")
+    p.add_argument("--qc-diagnostics-dir", default=None,
+                   help="QC gate 诊断输出目录")
     p.add_argument("--checkpoint", default=None)
     p.add_argument("--agri_file",  default=None)
     p.add_argument("--agri_dir",   default=None)

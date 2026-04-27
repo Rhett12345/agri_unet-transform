@@ -5,8 +5,8 @@ fusion_core.py
 
 本模块与 IO 解耦，只负责：
   1. 从已读取的 MYD06 字典列表中，将所有变量聚合到 AGRI 4km 像元上
-  2. 按变量类型使用不同聚合方法（COT=对数域中位数 / CER=加权均值 /
-     Phase=多数表决 / CTH=加权均值）
+  2. 先用 Phase 多数表决确定主相态，再在主相态候选内聚合
+     COT/CER/CTH（COT=对数域中位数 / CER=加权均值 / CTH=加权均值）
   3. 输出完整质量字段（time_diff, overlap_fraction, cloud_fraction,
      phase_consistency, sample_weight 等）
 
@@ -14,7 +14,7 @@ fusion_core.py
 --------
 - MYD06 → AGRI 聚合（绝不反向）
 - 质量优先：宁可 NaN，不做伪标签
-- 分辨率分离：1km 变量（CLP/CER/COT）与 5km 变量（CTH）分开聚合
+- 1km 变量（CLP/CER/COT/CTH_1km）共同收集；回归量按主相态分层聚合
 - 像元级时间过滤：scan_time 优先，文件名时间作 fallback 并降权
 - 全程向量化 + scipy KD-tree，无 Python 逐像元循环（关键路径）
 """
@@ -224,14 +224,15 @@ def aggregate_modis_to_agri(
     算法流程
     --------
     1. 对每个 MYD06 文件：
-       a. 优先使用 MYD03 1km 坐标；缺失时上采样 5km 坐标 → 1km（用于 CLP/CER/COT）
-       b. 构建 KD-tree（1km 和 5km 分别建）
-       c. query_ball_point：找每个 AGRI 像元 footprint 内所有 MYD06 像元
+       a. 优先使用 MYD03 1km 坐标；缺失时上采样 5km 坐标 → 1km
+       b. 构建 1km KD-tree
+       c. query_ball_point：先找每个 AGRI 像元附近的 MYD06 像元，再保留最近的
+          EXPECTED_1KM_PER_AGRI 个候选
        d. 逐 AGRI 像元收集候选值和时间权重（列表追加）
     2. 汇总阶段（全向量化）：
-       a. COT：对数域加权中位数（只用云像元）
-       b. CER：加权均值（只用云像元）
-       c. Phase：加权多数表决
+       a. Phase：加权多数表决
+       b. COT：对数域加权中位数（只用主相态云像元）
+       c. CER：加权均值（只用主相态云像元）
        d. CTH：加权均值
     3. 质量控制：对每个 AGRI 像元独立判断
        - 时间差 > TIME_LOW_Q → NaN
@@ -252,7 +253,7 @@ def aggregate_modis_to_agri(
       CLP, CER, COT, CTH          : (H_a, W_a) float32，NaN=无效
       MATCH_DT_MIN                 : 最优像元时间差
       OVERLAP_FRACTION             : 1km 空间覆盖率
-      VALID_PIX_1KM, VALID_PIX_5KM
+      VALID_PIX_1KM, VALID_PIX_5KM      : 后者为历史字段名，当前记录 CTH_1km 候选数
       CLOUD_FRACTION               : 有效 1km 中云像元比例
       PHASE_CONSISTENCY            : Phase 多数表决一致性
       SAMPLE_WEIGHT                : 综合样本权重（时间 × 覆盖）
@@ -293,6 +294,7 @@ def aggregate_modis_to_agri(
     buf_cth_v = _make_buf()
     buf_cth_w = _make_buf()
     buf_dt    = _make_buf()   # 时间差（用于输出 MATCH_DT_MIN）
+    buf_dist  = _make_buf()   # AGRI 中心到 MODIS 像元中心的距离 km
 
     # -------------------------------------------------------------------
     # 遍历每个 MYD06 文件
@@ -310,6 +312,7 @@ def aggregate_modis_to_agri(
             buf_cot_v, buf_cot_w,
             buf_cth_v, buf_cth_w,
             buf_dt,
+            buf_dist,
         )
 
     # -------------------------------------------------------------------
@@ -321,6 +324,10 @@ def aggregate_modis_to_agri(
     out_cot   = np.full(N_a, np.nan, np.float32)
     out_cth   = np.full(N_a, np.nan, np.float32)
     out_dt    = np.full(N_a, np.nan, np.float32)
+    out_dt_mean = np.full(N_a, np.nan, np.float32)
+    out_dt_max  = np.full(N_a, np.nan, np.float32)
+    out_dist_mean = np.full(N_a, np.nan, np.float32)
+    out_dist_p95  = np.full(N_a, np.nan, np.float32)
     out_ovlp  = np.zeros(N_a, np.float32)
     out_vpx1  = np.zeros(N_a, np.int32)
     out_vpx5  = np.zeros(N_a, np.int32)
@@ -338,6 +345,7 @@ def aggregate_modis_to_agri(
         cth_v = np.array(buf_cth_v[k], dtype=np.float32) if buf_cth_v[k] else np.array([], np.float32)
         cth_w = np.array(buf_cth_w[k], dtype=np.float32) if buf_cth_w[k] else np.array([], np.float32)
         dt_v  = np.array(buf_dt[k],    dtype=np.float32) if buf_dt[k]    else np.array([], np.float32)
+        dist_v = np.array(buf_dist[k], dtype=np.float32) if buf_dist[k] else np.array([], np.float32)
 
         n_1km = len(clp_v)
         out_vpx1[agri_idx] = n_1km
@@ -348,7 +356,9 @@ def aggregate_modis_to_agri(
             clp_v, clp_w = clp_v[keep_t], clp_w[keep_t]
             cer_v, cer_w = cer_v[keep_t], cer_w[keep_t]
             cot_v, cot_w = cot_v[keep_t], cot_w[keep_t]
+            cth_v, cth_w = cth_v[keep_t], cth_w[keep_t]
             dt_v = dt_v[keep_t]
+            dist_v = dist_v[keep_t]
             n_1km = len(clp_v)
 
         # overlap_fraction (1km)
@@ -359,6 +369,13 @@ def aggregate_modis_to_agri(
         valid_dt = dt_v[np.isfinite(clp_v)] if n_1km > 0 else np.array([])
         best_dt  = float(np.min(valid_dt)) if valid_dt.size > 0 else np.nan
         out_dt[agri_idx] = best_dt
+        if valid_dt.size > 0:
+            out_dt_mean[agri_idx] = float(np.mean(valid_dt))
+            out_dt_max[agri_idx] = float(np.max(valid_dt))
+        valid_dist = dist_v[np.isfinite(clp_v)] if n_1km > 0 and dist_v.size > 0 else np.array([])
+        if valid_dist.size > 0:
+            out_dist_mean[agri_idx] = float(np.mean(valid_dist))
+            out_dist_p95[agri_idx] = float(np.percentile(valid_dist, 95))
 
         # cloud_fraction
         n_valid_clp = int(np.isfinite(clp_v).sum())
@@ -374,28 +391,31 @@ def aggregate_modis_to_agri(
         # ---- Phase（多数表决）----
         phase_val, phase_con = aggregate_phase(clp_v, clp_w)
         out_phcon[agri_idx] = phase_con
-        if np.isfinite(phase_val) and phase_con >= fc.PHASE_CONSISTENCY_MIN:
+        phase_ok = np.isfinite(phase_val) and phase_con >= fc.PHASE_CONSISTENCY_MIN
+        if phase_ok:
             out_clp[agri_idx] = phase_val
 
-        # ---- COT / CER（只用云像元）----
+        # ---- COT / CER / CTH（只用主相态云像元）----
+        phase_cloud_mask = cloud_mask & phase_ok & (clp_v == phase_val)
+        n_phase_cloud = int(phase_cloud_mask.sum())
         cloud_ok = (
-            n_cloud >= fc.MIN_VALID_PIX and
+            n_phase_cloud >= fc.MIN_VALID_PIX and
             np.isfinite(cfrac) and cfrac >= fc.CLOUD_FRAC_MIN_CLOUDY and
             (not fc.PURE_CLOUD_ONLY or cfrac >= fc.PURE_CLOUD_FRAC)
         )
         if cloud_ok:
             out_cot[agri_idx] = aggregate_cot(
-                cot_v[cloud_mask], cot_w[cloud_mask]
+                cot_v[phase_cloud_mask], cot_w[phase_cloud_mask]
             )
             out_cer[agri_idx] = aggregate_cer(
-                cer_v[cloud_mask], cer_w[cloud_mask]
+                cer_v[phase_cloud_mask], cer_w[phase_cloud_mask]
             )
 
-        # ---- CTH（当前配置按 1km 主标签聚合）----
-        n_cth = len(cth_v)
+        # ---- CTH（当前配置按 CTH_1km 与主相态云候选聚合）----
+        n_cth = int(np.isfinite(cth_v[phase_cloud_mask]).sum()) if cloud_ok else 0
         out_vpx5[agri_idx] = n_cth
-        if n_cth > 0:
-            cth_val = aggregate_cth(cth_v, cth_w)
+        if cloud_ok and n_cth > 0:
+            cth_val = aggregate_cth(cth_v[phase_cloud_mask], cth_w[phase_cloud_mask])
             if np.isfinite(cth_val) and 0 <= cth_val <= 25000:
                 out_cth[agri_idx] = cth_val
 
@@ -403,18 +423,28 @@ def aggregate_modis_to_agri(
         tw = time_weight(best_dt) if np.isfinite(best_dt) else 0.0
         out_wt[agri_idx] = float(tw * ovlp)
 
+    scan_time_sources = sorted({str(m.get("_scan_time_source", "unknown")) for m in modis_list})
+    geo_sources = sorted({str(m.get("_geo_source", "unknown")) for m in modis_list})
     return {
         "CLP":               out_clp.reshape(H_a, W_a),
         "CER":               out_cer.reshape(H_a, W_a),
         "COT":               out_cot.reshape(H_a, W_a),
         "CTH":               out_cth.reshape(H_a, W_a),
         "MATCH_DT_MIN":      out_dt.reshape(H_a, W_a),
+        "MATCH_DT_MEAN":     out_dt_mean.reshape(H_a, W_a),
+        "MATCH_DT_MAX":      out_dt_max.reshape(H_a, W_a),
+        "MATCH_DIST_MEAN_KM": out_dist_mean.reshape(H_a, W_a),
+        "MATCH_DIST_P95_KM": out_dist_p95.reshape(H_a, W_a),
         "OVERLAP_FRACTION":  out_ovlp.reshape(H_a, W_a),
         "VALID_PIX_1KM":     out_vpx1.reshape(H_a, W_a),
         "VALID_PIX_5KM":     out_vpx5.reshape(H_a, W_a),
+        "VALID_PIX_CTH_1KM": out_vpx5.reshape(H_a, W_a),
         "CLOUD_FRACTION":    out_cfrac.reshape(H_a, W_a),
         "PHASE_CONSISTENCY": out_phcon.reshape(H_a, W_a),
         "SAMPLE_WEIGHT":     out_wt.reshape(H_a, W_a),
+        "_scan_time_sources": scan_time_sources,
+        "_geo_sources": geo_sources,
+        "_fallback_granules": int(sum(bool(m.get("_scan_time_is_fallback", True)) for m in modis_list)),
     }
 
 
@@ -434,6 +464,7 @@ def _collect_1km(
     buf_cot_v, buf_cot_w,
     buf_cth_v, buf_cth_w,
     buf_dt,
+    buf_dist,
 ):
     clp_2d = m.get("CLP_1km")
     cer_2d = m.get("CER_1km")
@@ -494,21 +525,28 @@ def _collect_1km(
     w_k = np.where(
         dt_k <= fc.TIME_HIGH_Q_MIN,
         1.0,
-        0.5 * (1.0 - (dt_k - fc.TIME_HIGH_Q_MIN) /
-               (fc.TIME_LOW_Q_MIN - fc.TIME_HIGH_Q_MIN))
+        1.0 - 0.5 * (dt_k - fc.TIME_HIGH_Q_MIN) /
+        (fc.TIME_LOW_Q_MIN - fc.TIME_HIGH_Q_MIN)
     ).astype(np.float32)
     if fallback:
         w_k *= fc.SCAN_TIME_FALLBACK_WEIGHT
 
     m_xyz = latlon_to_xyz(lat_k, lon_k)
     tree  = cKDTree(m_xyz)
-    # query_ball_point：对每个 AGRI 像元找 footprint 内所有 1km 点（聚合思路）
+    # query_ball_point 只做空间预筛；随后按距离保留约 4km footprint 对应的 16 个 1km 点。
     nbrs_list = tree.query_ball_point(a_xyz, r=chord, workers=1)
+    max_candidates = max(1, int(round(float(fc.EXPECTED_1KM_PER_AGRI))))
 
     for k_a, nbrs in enumerate(nbrs_list):
         if len(nbrs) == 0:
             continue
         nbrs = np.asarray(nbrs, dtype=np.int64)
+        d = np.linalg.norm(m_xyz[nbrs] - a_xyz[k_a], axis=1)
+        d = 2.0 * 6371.0 * np.arcsin(np.clip(d * 0.5, 0.0, 1.0))
+        if nbrs.size > max_candidates:
+            order = np.argsort(d, kind="stable")[:max_candidates]
+            nbrs = nbrs[order]
+            d = d[order]
         buf_clp_v[k_a].extend(clp_k[nbrs].tolist())
         buf_clp_w[k_a].extend(w_k[nbrs].tolist())
         buf_cer_v[k_a].extend(cer_k[nbrs].tolist())
@@ -518,6 +556,7 @@ def _collect_1km(
         buf_cth_v[k_a].extend(cth_k[nbrs].tolist())
         buf_cth_w[k_a].extend(w_k[nbrs].tolist())
         buf_dt[k_a].extend(dt_k[nbrs].tolist())
+        buf_dist[k_a].extend(d.astype(np.float32).tolist())
 
 
 # ---------------------------------------------------------------------------
@@ -531,8 +570,12 @@ def _empty_output(H: int, W: int) -> dict:
     return {
         "CLP": nan2d.copy(), "CER": nan2d.copy(),
         "COT": nan2d.copy(), "CTH": nan2d.copy(),
-        "MATCH_DT_MIN": nan2d.copy(), "OVERLAP_FRACTION": zero2d.copy(),
+        "MATCH_DT_MIN": nan2d.copy(), "MATCH_DT_MEAN": nan2d.copy(), "MATCH_DT_MAX": nan2d.copy(),
+        "MATCH_DIST_MEAN_KM": nan2d.copy(), "MATCH_DIST_P95_KM": nan2d.copy(),
+        "OVERLAP_FRACTION": zero2d.copy(),
         "VALID_PIX_1KM": int2d.copy(), "VALID_PIX_5KM": int2d.copy(),
+        "VALID_PIX_CTH_1KM": int2d.copy(),
         "CLOUD_FRACTION": nan2d.copy(), "PHASE_CONSISTENCY": nan2d.copy(),
         "SAMPLE_WEIGHT": zero2d.copy(),
+        "_scan_time_sources": [], "_geo_sources": [], "_fallback_granules": 0,
     }

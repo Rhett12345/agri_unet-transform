@@ -6,13 +6,42 @@ All paths, hyper-parameters and flags live here.
 Edit this file ONLY – every other script imports from it.
 """
 
+import os
 from pathlib import Path
+
+
+def _env_list(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default)
+    raw = raw.strip()
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _env_float(name, default):
+    return float(os.environ.get(name, str(default)))
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_path(name, default):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return Path(default)
+    return Path(raw).expanduser()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  Root directories
 # ─────────────────────────────────────────────────────────────────────────────
-# ROOT = Path("/data/Data_yuq/unet_workdir")           # Change to your project root
-ROOT = Path("/home/yuq/cloudmask/unet/unet_workdir")
+ROOT = _env_path("UNET_WORKDIR", "/data/Data_yuq/unet_workdir")
+# ROOT = Path("/home/yuq/cloudmask/unet/unet_workdir")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Raw data – folder-per-day layout
@@ -110,28 +139,28 @@ REG_USE_GEO_FILTER = True
 # Patch 监督样本过滤规则（train / val / test 共用同一套默认策略）。
 # 最终门槛 = max(最少像元数, patch_area * 最小占比)。
 # 32×32 patch 下，默认要求：
-#   - 至少 128 个有效 CLP 监督像元（12.5%）
-#   - 至少 64 个“有云且 CER/COT/CTH 同时有效”的监督像元（6.25%）
-# 这样可以显著减少只有零星监督像元的低质量 patch，同时不过分牺牲样本量。
+#   - 足够的有效 CLP 监督像元
+#   - 不再强制要求有云回归像元，避免 clear-dominant patch 被系统性丢弃
+# 回归监督缺失时训练 loss 会自动 mask，不影响 CLP 分类学习。
 PATCH_FILTER_RULES = {
     "default": {
         "min_valid_label_pixels": 256,
         "min_valid_label_ratio": 0.25,
-        "min_valid_cloudy_pixels": 128,
-        "min_valid_cloudy_ratio": 0.125,
+        "min_valid_cloudy_pixels": 0,
+        "min_valid_cloudy_ratio": 0.0,
     },
     "train": {},
     "val": {
         "min_valid_label_pixels": 128,
         "min_valid_label_ratio": 0.125,
-        "min_valid_cloudy_pixels": 64,
-        "min_valid_cloudy_ratio": 0.0625,
+        "min_valid_cloudy_pixels": 0,
+        "min_valid_cloudy_ratio": 0.0,
     },
     "test": {
         "min_valid_label_pixels": 128,
         "min_valid_label_ratio": 0.125,
-        "min_valid_cloudy_pixels": 64,
-        "min_valid_cloudy_ratio": 0.0625,
+        "min_valid_cloudy_pixels": 0,
+        "min_valid_cloudy_ratio": 0.0,
     },
 }
 
@@ -147,9 +176,13 @@ MODIS_FILTER_WEAK_QUALITY = True
 
 # Cloud_Mask cloudiness: 0=Confident Cloudy, 1=Probably Cloudy,
 #                        2=Probably Clear,  3=Confident Clear
-# 默认仅保留高置信度 cloudy / clear，排除 probably cloudy / probably clear。
-MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM = (0, 3)
-MODIS_ALLOWED_CLOUD_MASK_FLAGS_5KM = (0, 3)
+# CLP 是分类监督，保留所有状态有效的 cloud mask 像元；
+# CER/COT/CTH 是回归监督，仍只保留高置信度 cloudy / clear 以控制噪声。
+MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_CLP = (0, 1, 2, 3)
+MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_REG = (0, 3)
+# Backward-compatible aliases for older code paths.
+MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM = MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_REG
+MODIS_ALLOWED_CLOUD_MASK_FLAGS_5KM = MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_REG
 
 # 光学厚度 / 有效半径不确定度过大时视为弱质量。
 # 0~200% 是产品公开范围；默认 80% 能过滤明显不稳定的检索结果，
@@ -176,11 +209,30 @@ PATCH_OVERLAP = 16          # pixels overlap used in inference sliding window
 
 # Train / val / test date split  (folder names, YYYYMMDD)
 # Leave empty lists to use ALL available days in each split dir.
-# Small diagnostic split for the current 3-class experiment.
-# Leave empty lists to use all available days under each paired split directory.
-TRAIN_DATES = ["20190105", "20190115", "20190205"]
-VAL_DATES   = ["20190125"]
-TEST_DATES  = ["20190225"]
+# 2019 full-year split from the 36 common FY4A/MYD03/MYD06 dates.
+# Each month contributes two train days; the mid-month day alternates val/test.
+TRAIN_DATES = _env_list("UNET_TRAIN_DATES", [
+    "20190105", "20190125",
+    "20190205", "20190225",
+    "20190305", "20190325",
+    "20190405", "20190425",
+    "20190505", "20190525",
+    "20190605", "20190625",
+    "20190705", "20190725",
+    "20190805", "20190825",
+    "20190905", "20190925",
+    "20191005", "20191025",
+    "20191105", "20191125",
+    "20191205", "20191225",
+])
+VAL_DATES   = _env_list("UNET_VAL_DATES", [
+    "20190115", "20190315", "20190515",
+    "20190715", "20190915", "20191115",
+])
+TEST_DATES  = _env_list("UNET_TEST_DATES", [
+    "20190215", "20190415", "20190615",
+    "20190815", "20191015", "20191215",
+])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  Model hyper-parameters
@@ -207,17 +259,27 @@ LR_PATIENCE   = 6
 LR_FACTOR     = 0.5
 MIN_LR        = 1e-6
 GRAD_CLIP     = 1.0
-NUM_WORKERS   = 4
+NUM_WORKERS   = 5
 
 # Early stopping
 EARLY_STOP_PATIENCE = 10
 
 # Loss weights  (CLP_CE + w_cer*CER + w_cot*COT + w_cth*CTH)
 # 原来 CLP=0.5 被回归任务淹没，改为等权；待模型收敛后可再调整
-LOSS_W_CLP = 1.0
-LOSS_W_CER = 1.0
-LOSS_W_COT = 1.0
-LOSS_W_CTH = 1.0
+LOSS_W_CLP = _env_float("UNET_LOSS_W_CLP", 1.0)
+LOSS_W_CER = _env_float("UNET_LOSS_W_CER", 1.0)
+LOSS_W_COT = _env_float("UNET_LOSS_W_COT", 1.0)
+LOSS_W_CTH = _env_float("UNET_LOSS_W_CTH", 1.0)
+
+# Optional sample-level quality gate for upper-bound experiments.
+SAMPLE_QUALITY_FILTER_ENABLED = _env_bool("UNET_SAMPLE_QUALITY_FILTER", False)
+QUALITY_MIN_OVERLAP_FRAC = _env_float("UNET_QUALITY_MIN_OVERLAP_FRAC", 0.0)
+QUALITY_MAX_TIME_DIFF_MIN = _env_float("UNET_QUALITY_MAX_TIME_DIFF_MIN", 1e9)
+QUALITY_MIN_PHASE_CONSIST = _env_float("UNET_QUALITY_MIN_PHASE_CONSIST", 0.0)
+QUALITY_MIN_CLOUD_FRAC = _env_float("UNET_QUALITY_MIN_CLOUD_FRAC", 0.0)
+QUALITY_MIN_VALID_CLOUDY_PIXELS = int(os.environ.get("UNET_QUALITY_MIN_VALID_CLOUDY_PIXELS", "0"))
+
+CHECKPOINT_MONITOR = os.environ.get("UNET_CHECKPOINT_MONITOR", "val_loss")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. Checkpoint naming
@@ -225,6 +287,9 @@ LOSS_W_CTH = 1.0
 MODEL_NAME     = "HIR_COMP_UNet_AGRIonly"
 CHECKPOINT_BEST = MODEL_DIR / f"{MODEL_NAME}_best.pth"
 CHECKPOINT_LAST = MODEL_DIR / f"{MODEL_NAME}_last.pth"
+CHECKPOINT_BEST_LOSS = MODEL_DIR / f"{MODEL_NAME}_best_loss.pth"
+CHECKPOINT_BEST_OA = MODEL_DIR / f"{MODEL_NAME}_best_oa.pth"
+CHECKPOINT_BEST_MACRO = MODEL_DIR / f"{MODEL_NAME}_best_macro.pth"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 11. Evaluation / inference

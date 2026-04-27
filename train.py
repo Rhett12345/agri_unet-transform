@@ -127,7 +127,43 @@ def _batch_metrics(clp_logits, comp_out, labels, stats: NormStats, device):
     }
     for c in range(cfg.CLP_CLASSES):
         result[f"cls{c}_acc"] = per_class_acc[c]
+    valid_acc = [acc for acc in per_class_acc if acc >= 0.0]
+    result["macro_acc"] = float(np.mean(valid_acc)) if valid_acc else 0.0
     return result
+
+
+def _macro_acc(metrics):
+    values = [
+        float(metrics[f"cls{c}_acc"])
+        for c in range(cfg.CLP_CLASSES)
+        if f"cls{c}_acc" in metrics and float(metrics[f"cls{c}_acc"]) >= 0.0
+    ]
+    return float(np.mean(values)) if values else 0.0
+
+
+def _metric_value(metrics, monitor: str):
+    monitor = (monitor or "val_loss").lower()
+    if monitor in {"val_loss", "loss"}:
+        return float(metrics["loss"])
+    if monitor in {"val_oa", "oa"}:
+        return float(metrics["oa"])
+    if monitor in {"val_macro_acc", "macro_acc", "balanced_acc"}:
+        return float(metrics.get("macro_acc", _macro_acc(metrics)))
+    raise ValueError(f"Unsupported checkpoint monitor: {monitor}")
+
+
+def _monitor_mode(monitor: str) -> str:
+    return "min" if (monitor or "").lower() in {"val_loss", "loss"} else "max"
+
+
+def _is_better(candidate, current, monitor: str) -> bool:
+    if current is None:
+        return True
+    cand_v = _metric_value(candidate, monitor)
+    curr_v = _metric_value(current, monitor)
+    if _monitor_mode(monitor) == "min":
+        return cand_v < curr_v
+    return cand_v > curr_v
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Epoch runners
@@ -142,7 +178,8 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
     model.train(training)
 
     totals = {"loss": 0.0, "clp": 0.0, "cer": 0.0, "cot": 0.0, "cth": 0.0,
-              "oa": 0.0, "cer_rmse": 0.0, "cot_rmse": 0.0, "cth_rmse": 0.0, "n": 0}
+              "oa": 0.0, "macro_acc": 0.0,
+              "cer_rmse": 0.0, "cot_rmse": 0.0, "cth_rmse": 0.0, "n": 0}
     for c in range(cfg.CLP_CLASSES):
         totals[f"cls{c}_acc"] = 0.0
 
@@ -179,6 +216,7 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
         totals["cot"]      += l_cot.item()  * B
         totals["cth"]      += l_cth.item()  * B
         totals["oa"]       += m["oa"]       * B
+        totals["macro_acc"] += m["macro_acc"] * B
         totals["cer_rmse"] += m["cer_rmse"] * B
         totals["cot_rmse"] += m["cot_rmse"] * B
         totals["cth_rmse"] += m["cth_rmse"] * B
@@ -239,8 +277,11 @@ def train(stats: NormStats):
     ce_fn  = nn.CrossEntropyLoss(ignore_index=-100, weight=class_weights.to(device))
     reg_fn = nn.SmoothL1Loss()
 
-    best_val_loss = float("inf")
-    best_val_oa   = 0.0
+    monitor = getattr(cfg, "CHECKPOINT_MONITOR", "val_loss")
+    best_selected = None
+    best_loss = None
+    best_oa = None
+    best_macro = None
     epochs_no_best = 0
     log_rows      = []
 
@@ -275,14 +316,32 @@ def train(stats: NormStats):
         )
 
         # ── Checkpoints ───────────────────────────────────────────────────
-        is_best = val_m["loss"] < best_val_loss
+        if _is_better(val_m, best_loss, "val_loss"):
+            best_loss = dict(val_m)
+            torch.save(model.state_dict(), cfg.CHECKPOINT_BEST_LOSS)
+            if monitor == "val_loss":
+                torch.save(model.state_dict(), cfg.CHECKPOINT_BEST)
+
+        if _is_better(val_m, best_oa, "val_oa"):
+            best_oa = dict(val_m)
+            torch.save(model.state_dict(), cfg.CHECKPOINT_BEST_OA)
+            if monitor == "val_oa":
+                torch.save(model.state_dict(), cfg.CHECKPOINT_BEST)
+
+        if _is_better(val_m, best_macro, "val_macro_acc"):
+            best_macro = dict(val_m)
+            torch.save(model.state_dict(), cfg.CHECKPOINT_BEST_MACRO)
+            if monitor == "val_macro_acc":
+                torch.save(model.state_dict(), cfg.CHECKPOINT_BEST)
+
+        is_best = _is_better(val_m, best_selected, monitor)
         if is_best:
-            best_val_loss = val_m["loss"]
-            best_val_oa   = val_m["oa"]
+            best_selected = dict(val_m)
             epochs_no_best = 0
             torch.save(model.state_dict(), cfg.CHECKPOINT_BEST)
-            log.info("  ✓ New best val loss: %.6f (OA=%.2f%%) → saved %s",
-                     best_val_loss, best_val_oa, cfg.CHECKPOINT_BEST.name)
+            log.info("  ✓ New best %s: %.6f (OA=%.2f%% Macro=%.2f%%) → saved %s",
+                     monitor, _metric_value(val_m, monitor), val_m["oa"],
+                     val_m["macro_acc"], cfg.CHECKPOINT_BEST.name)
         else:
             epochs_no_best += 1
 
@@ -300,5 +359,7 @@ def train(stats: NormStats):
                      epoch, epochs_no_best)
             break
 
-    log.info("Training complete. Best val loss: %.6f, best val OA: %.2f%%",
-             best_val_loss, best_val_oa)
+    if best_selected is not None:
+        log.info("Training complete. Best %s: %.6f, OA: %.2f%%, Macro: %.2f%%",
+                 monitor, _metric_value(best_selected, monitor),
+                 best_selected["oa"], best_selected["macro_acc"])

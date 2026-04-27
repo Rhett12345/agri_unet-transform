@@ -36,7 +36,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 import config as cfg
-from sample_filters import get_patch_supervision_thresholds, patch_passes_supervision
+from sample_filters import (
+    get_patch_supervision_thresholds,
+    patch_passes_supervision,
+    sample_passes_quality,
+)
 
 log = logging.getLogger(__name__)
 
@@ -137,27 +141,43 @@ def _stats_worker(h5_path: str) -> Optional[dict]:
         log.warning("Stats worker failed for %s: %s", h5_path, exc)
         return None
 
-    # 只保留输入和标签都有限的像素
-    valid = np.isfinite(flat_bt).all(axis=1) & np.isfinite(flat_out).all(axis=1)
-    if valid.sum() == 0:
+    valid_bt = np.isfinite(flat_bt).all(axis=1)
+    valid_out = np.isfinite(flat_out)
+    n_bt = int(valid_bt.sum())
+    n_out = valid_out.sum(axis=0).astype(np.int64)
+
+    if n_bt == 0 or np.any(n_out == 0):
         return None
 
-    flat_bt = flat_bt[valid]
-    flat_out = flat_out[valid]
-    n = flat_bt.shape[0]
+    bt_valid = flat_bt[valid_bt]
+    sum_bt = bt_valid.sum(axis=0)
+    sumsq_bt = (bt_valid ** 2).sum(axis=0)
 
-    sum_bt = flat_bt.sum(axis=0)
-    sumsq_bt = (flat_bt ** 2).sum(axis=0)
-    sum_out = flat_out.sum(axis=0)
-    sumsq_out = (flat_out ** 2).sum(axis=0)
+    sum_out = np.zeros(4, dtype=np.float64)
+    sumsq_out = np.zeros(4, dtype=np.float64)
+    for ch in range(4):
+        vals = flat_out[valid_out[:, ch], ch]
+        sum_out[ch] = vals.sum()
+        sumsq_out[ch] = (vals ** 2).sum()
 
-    reg = flat_out[:, 1:]   # CER/COT/CTH
-    if n > MAX_SAMPLE:
-        idx = np.random.choice(n, MAX_SAMPLE, replace=False)
-        reg = reg[idx]
+    reg_samples = []
+    max_reg_n = 0
+    for ch in range(1, 4):
+        vals = flat_out[valid_out[:, ch], ch]
+        if vals.size > MAX_SAMPLE:
+            idx = np.random.choice(vals.size, MAX_SAMPLE, replace=False)
+            vals = vals[idx]
+        reg_samples.append(vals)
+        max_reg_n = max(max_reg_n, vals.size)
+
+    reg = np.full((max_reg_n, 3), np.nan, dtype=np.float64)
+    for ch, vals in enumerate(reg_samples):
+        reg[:vals.size, ch] = vals
 
     return {
-        "n": n,
+        "n": n_bt,
+        "n_bt": n_bt,
+        "n_out": n_out,
         "sum_bt": sum_bt,
         "sumsq_bt": sumsq_bt,
         "sum_out": sum_out,
@@ -191,7 +211,8 @@ def compute_and_save_stats(
     n_agri = cfg.AGRI_CHANNELS
     n_out  = 4
 
-    total_n   = 0
+    total_n_bt = 0
+    total_n_out = np.zeros(n_out, dtype=np.int64)
     sum_bt    = np.zeros(n_agri, dtype=np.float64)
     sumsq_bt  = np.zeros(n_agri, dtype=np.float64)
     sum_out   = np.zeros(n_out, dtype=np.float64)
@@ -214,8 +235,10 @@ def compute_and_save_stats(
                 log.warning("Skip %s (worker returned None)", p)
                 continue
 
-            n = result["n"]
-            total_n   += n
+            n_bt = result.get("n_bt", result["n"])
+            n_out_ch = result.get("n_out", np.full(n_out, result["n"], dtype=np.int64))
+            total_n_bt += n_bt
+            total_n_out += n_out_ch
             sum_bt    += result["sum_bt"]
             sumsq_bt  += result["sumsq_bt"]
             sum_out   += result["sum_out"]
@@ -233,24 +256,27 @@ def compute_and_save_stats(
                 reservoir_n = MAX_RESERVOIR
 
             if done % 10 == 0 or done == len(paths):
-                log.info("  %d / %d files processed  (total valid px so far: %d)",
-                         done, len(paths), total_n)
+                log.info("  %d / %d files processed  (valid BT px so far: %d)",
+                         done, len(paths), total_n_bt)
 
-    if total_n < 2:
-        raise RuntimeError("Not enough valid pixels to compute statistics.")
+    if total_n_bt < 2 or np.any(total_n_out < 2):
+        raise RuntimeError(
+            "Not enough valid pixels to compute statistics "
+            f"(BT={total_n_bt}, outputs={total_n_out.tolist()})."
+        )
 
-    agri_mean = (sum_bt  / total_n).astype(np.float32)
-    out_mean  = (sum_out / total_n).astype(np.float32)
+    agri_mean = (sum_bt  / total_n_bt).astype(np.float32)
+    out_mean  = (sum_out / total_n_out).astype(np.float32)
 
-    agri_var = (sumsq_bt  - (sum_bt  ** 2) / total_n) / (total_n - 1)
-    out_var  = (sumsq_out - (sum_out ** 2) / total_n) / (total_n - 1)
+    agri_var = (sumsq_bt  - (sum_bt  ** 2) / total_n_bt) / (total_n_bt - 1)
+    out_var  = (sumsq_out - (sum_out ** 2) / total_n_out) / (total_n_out - 1)
 
     agri_std = np.sqrt(np.maximum(agri_var, 1e-12)).astype(np.float32)
     out_std  = np.sqrt(np.maximum(out_var,  1e-12)).astype(np.float32)
 
-    all_reg = np.concatenate(reservoir, axis=0)   # (N_total, 3)
-    q5  = np.concatenate([[0.0], np.percentile(all_reg,  5, axis=0)])
-    q95 = np.concatenate([[float(cfg.CLP_CLASSES - 1)], np.percentile(all_reg, 95, axis=0)])
+    all_reg = np.concatenate(reservoir, axis=0)   # (N_total, 3), NaN-padded by channel
+    q5  = np.concatenate([[0.0], np.nanpercentile(all_reg,  5, axis=0)])
+    q95 = np.concatenate([[float(cfg.CLP_CLASSES - 1)], np.nanpercentile(all_reg, 95, axis=0)])
 
     stats = NormStats(
         agri_mean=agri_mean, agri_std=agri_std,
@@ -258,7 +284,10 @@ def compute_and_save_stats(
         out_q5=q5.astype(np.float32), out_q95=q95.astype(np.float32),
     )
     stats.save(out_path)
-    log.info("Stats computed from %d valid pixels across %d files", total_n, len(h5_files))
+    log.info(
+        "Stats computed across %d files (BT valid px=%d, output valid px=%s)",
+        len(h5_files), total_n_bt, total_n_out.tolist()
+    )
     return stats
 
 
@@ -289,6 +318,25 @@ def _build_patch_index(
 
     thresholds = get_patch_supervision_thresholds(mode, patch_size)
 
+    def _sample_values(samples, names, idx):
+        for name in names:
+            if name in samples:
+                return samples[name][idx]
+        return np.nan
+
+    def _sample_quality_fields(samples, idx):
+        return {
+            "mean_overlap_frac": _sample_values(samples, ["mean_overlap_frac"], idx),
+            "max_time_diff_min": _sample_values(samples, ["max_time_diff_min"], idx),
+            "mean_phase_consist": _sample_values(samples, ["mean_phase_consist"], idx),
+            "mean_cloud_frac": _sample_values(samples, ["mean_cloud_frac"], idx),
+            "valid_cloudy_pixels": _sample_values(
+                samples,
+                ["valid_cloudy_pixels", "valid_cloudy_px"],
+                idx,
+            ),
+        }
+
     for h5f in h5_files:
         try:
             with h5py.File(h5f, "r") as f:
@@ -306,6 +354,7 @@ def _build_patch_index(
                             if (
                                 int(valid_label_pixels[s]) >= thresholds["min_valid_label_pixels"]
                                 and int(valid_cloudy_pixels[s]) >= thresholds["min_valid_cloudy_pixels"]
+                                and sample_passes_quality(_sample_quality_fields(samples, s))
                             ):
                                 index.append((h5f, s, -1))
                     else:
@@ -314,7 +363,7 @@ def _build_patch_index(
                             keep, _counts, _ = patch_passes_supervision(
                                 patch_clp, patch_cer, patch_cot, patch_cth, mode, patch_size
                             )
-                            if keep:
+                            if keep and sample_passes_quality(_sample_quality_fields(samples, s)):
                                 index.append((h5f, s, -1))
                     continue
 
@@ -527,3 +576,12 @@ def build_dataloaders(stats: NormStats):
     test_dl  = DataLoader(test_ds,  batch_size=1,              shuffle=False, **common)
 
     return train_dl, val_dl, test_dl
+
+
+def build_test_dataloader(stats: NormStats):
+    """Return only the test DataLoader using config paths."""
+    log.info("Loading test split only from %s (mode=test)", cfg.PAIRED_TEST_DIR)
+    test_ds = AGRIMyd06Dataset(cfg.PAIRED_TEST_DIR, stats, mode="test")
+
+    common = dict(pin_memory=True, num_workers=cfg.NUM_WORKERS)
+    return DataLoader(test_ds, batch_size=1, shuffle=False, **common)

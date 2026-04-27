@@ -30,6 +30,7 @@ import fusion_config as fc
 from sample_filters import get_patch_supervision_thresholds, patch_passes_supervision
 
 log = logging.getLogger(__name__)
+_QC_DIAG_MISSING_WARNED = set()
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +312,15 @@ def _sds_optional(sd: SD, name: str, use_sds_sf: bool = False,
         return None
 
 
+
+
+def _isin_finite_int(values: np.ndarray, allowed: np.ndarray) -> np.ndarray:
+    out = np.zeros(values.shape, dtype=bool)
+    finite = np.isfinite(values)
+    if finite.any():
+        out[finite] = np.isin(values[finite].astype(np.int32), allowed)
+    return out
+
 def _decode_cloud_mask(cm: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if cm is None:
         return None
@@ -325,29 +335,54 @@ def _decode_cloud_mask(cm: Optional[np.ndarray]) -> Optional[np.ndarray]:
     return out
 
 
-def _read_scan_time_as_offset_min(sd: SD, file_dt: datetime) -> Optional[np.ndarray]:
+def _scan_seconds_to_offset_grid(
+    seconds: np.ndarray,
+    target_shape: Tuple[int, int],
+    ref_dt: datetime,
+) -> Optional[np.ndarray]:
+    """Expand MODIS TAI93 scan seconds to a 1km grid of minute offsets from ref_dt."""
+    arr = np.asarray(seconds, dtype=np.float64)
+    arr[(arr <= -1.0e9) | ~np.isfinite(arr)] = np.nan
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return None
+
+    tai_epoch = datetime(1993, 1, 1)
+    ref_seconds = (ref_dt - tai_epoch).total_seconds()
+    offset_min = ((arr - ref_seconds) / 60.0).astype(np.float32)
+
+    rows, cols = target_shape
+    if offset_min.ndim == 1:
+        row_repeat = max(1, int(np.ceil(rows / max(offset_min.shape[0], 1))))
+        row_vals = np.repeat(offset_min, row_repeat)[:rows]
+        if row_vals.shape[0] < rows:
+            row_vals = np.pad(row_vals, (0, rows - row_vals.shape[0]), mode="edge")
+        return np.tile(row_vals[:, np.newaxis], (1, cols)).astype(np.float32)
+
+    if offset_min.ndim == 2:
+        rh = max(1, int(np.ceil(rows / max(offset_min.shape[0], 1))))
+        rw = max(1, int(np.ceil(cols / max(offset_min.shape[1], 1))))
+        grid = np.repeat(np.repeat(offset_min, rh, axis=0), rw, axis=1)
+        if grid.shape[0] < rows:
+            grid = np.pad(grid, ((0, rows - grid.shape[0]), (0, 0)), mode="edge")
+        if grid.shape[1] < cols:
+            grid = np.pad(grid, ((0, 0), (0, cols - grid.shape[1])), mode="edge")
+        return grid[:rows, :cols].astype(np.float32)
+
+    return None
+
+
+def _read_scan_time_as_offset_min(
+    sd: SD,
+    ref_dt: datetime,
+    target_shape: Tuple[int, int],
+) -> Optional[np.ndarray]:
     """
-    读取 MYD06 Scan_Start_Time → 相对文件名时间的分钟偏移（像元级，1km 分辨率）。
-    这是像元级时间的唯一来源；失败时返回 None（外部 fallback 到文件名时间）。
+    读取 MYD06 Scan_Start_Time → 相对 AGRI 时间的分钟偏移（1km 分辨率）。
+    MYD06 常见为 5km 二维时间场，需重复展开到 1km 标签形状。
     """
     try:
-        sst = sd.select("Scan_Start_Time")[:]          # (n_scans,) TAI93 秒
-        tai_epoch = datetime(1993, 1, 1)
-        offsets_min = np.array([
-            (tai_epoch + timedelta(seconds=float(t)) - file_dt).total_seconds() / 60.0
-            for t in sst
-        ], dtype=np.float32)
-
-        clp_shape = sd.select(cfg.MODIS_VARS["CLP"])[:].shape
-        n_rows_1km, n_cols_1km = clp_shape
-
-        # 每条 5km scan → 5 条 1km scan（重复，不插值）
-        scan_1km = np.repeat(offsets_min, 5)
-        if scan_1km.shape[0] < n_rows_1km:
-            scan_1km = np.pad(scan_1km, (0, n_rows_1km - scan_1km.shape[0]),
-                              mode="edge")
-        scan_1km = scan_1km[:n_rows_1km]
-        return np.tile(scan_1km[:, np.newaxis], (1, n_cols_1km)).astype(np.float32)
+        sst = sd.select("Scan_Start_Time")[:]
+        return _scan_seconds_to_offset_grid(sst, target_shape, ref_dt)
     except Exception as exc:
         log.debug("Scan_Start_Time unavailable: %s", exc)
         return None
@@ -384,11 +419,18 @@ def _apply_qa_filter(
         return dict(CLP=clp, CER=cer, COT=cot, CTH=cth)
 
     if cm_1km is not None and cm_1km.shape == clp.shape:
-        ok = np.isin(cm_1km, np.asarray(cfg.MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM))
-        clp[~ok] = np.nan
-        cer[~ok] = np.nan
-        cot[~ok] = np.nan
-        cth[~ok] = np.nan
+        clp_allowed = np.asarray(
+            getattr(cfg, "MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_CLP", cfg.MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM)
+        )
+        reg_allowed = np.asarray(
+            getattr(cfg, "MODIS_ALLOWED_CLOUD_MASK_FLAGS_FOR_REG", cfg.MODIS_ALLOWED_CLOUD_MASK_FLAGS_1KM)
+        )
+        clp_ok = np.isin(cm_1km, clp_allowed)
+        reg_ok = np.isin(cm_1km, reg_allowed)
+        clp[~clp_ok] = np.nan
+        cer[~reg_ok] = np.nan
+        cot[~reg_ok] = np.nan
+        cth[~reg_ok] = np.nan
 
     if cer_unc is not None and cer_unc.shape == cer.shape:
         cer[(~np.isfinite(cer_unc)) | (cer_unc > cfg.MODIS_MAX_CER_UNCERTAINTY_PCT)] = np.nan
@@ -397,7 +439,7 @@ def _apply_qa_filter(
 
     if bool(getattr(cfg, "MODIS_REQUIRE_OPTICAL_PHASE_FOR_COP", False)) and clp_opt_raw is not None and clp_opt_raw.shape == clp.shape:
         allowed = np.asarray(getattr(cfg, "MODIS_ALLOWED_OPTICAL_PHASES_FOR_COP", ()), dtype=np.int32)
-        ok_opt = np.isin(clp_opt_raw.astype(np.int32), allowed)
+        ok_opt = _isin_finite_int(clp_opt_raw, allowed)
         cer[~ok_opt] = np.nan
         cot[~ok_opt] = np.nan
 
@@ -416,20 +458,40 @@ def _apply_qa_filter(
             cth_ok &= np.isfinite(ctt_1km)
         if ctm_1km is not None and ctm_1km.shape == cth.shape:
             allowed_methods = np.asarray(getattr(cfg, "MODIS_ALLOWED_CLOUD_TOP_METHODS", ()), dtype=np.int32)
-            cth_ok &= np.isin(ctm_1km.astype(np.int32), allowed_methods)
+            cth_ok &= _isin_finite_int(ctm_1km, allowed_methods)
         cth[~cth_ok] = np.nan
 
     return dict(CLP=clp, CER=cer, COT=cot, CTH=cth)
 
 
-def read_myd03(myd03_file: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """读取 MYD03 1km Latitude / Longitude。"""
+def _read_myd03_scan_time(sd: SD, target_shape: Tuple[int, int], ref_dt: datetime) -> Tuple[Optional[np.ndarray], str]:
+    for name in ("EV start time", "EV_start_time", "EV_Start_Time", "EV center time", "EV_center_time"):
+        try:
+            grid = _scan_seconds_to_offset_grid(sd.select(name)[:], target_shape, ref_dt)
+            if grid is not None:
+                return grid, name
+        except Exception:
+            continue
+    return None, "none"
+
+
+def read_myd03(myd03_file: Path, ref_dt: Optional[datetime] = None) -> Optional[dict]:
+    """读取 MYD03 1km Latitude / Longitude，并尽量读取扫描行时间。"""
     try:
         sd = SD(str(myd03_file), SDC.READ)
         lat_1km = sd.select("Latitude")[:].astype(np.float32)
         lon_1km = sd.select("Longitude")[:].astype(np.float32)
+        scan_time = None
+        scan_time_source = "none"
+        if ref_dt is not None:
+            scan_time, scan_time_source = _read_myd03_scan_time(sd, lat_1km.shape, ref_dt)
         sd.end()
-        return lat_1km, lon_1km
+        return {
+            "lat_1km": lat_1km,
+            "lon_1km": lon_1km,
+            "scan_time_1km": scan_time,
+            "scan_time_source": scan_time_source,
+        }
     except Exception as exc:
         log.warning("read_myd03 failed %s: %s", myd03_file, exc)
         return None
@@ -467,20 +529,23 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file:
 
         file_dt = parse_modis_datetime(modis_file.name)
         ref_dt = agri_dt or file_dt
-        scan_t = None
-        fallback = True
+        myd06_scan_t = None
         if ref_dt is not None:
-            scan_t = _read_scan_time_as_offset_min(sd, ref_dt)
-            fallback = (scan_t is None)
+            myd06_scan_t = _read_scan_time_as_offset_min(sd, ref_dt, clp_1km.shape)
+        scan_t = None
+        scan_time_source = "none"
+        fallback = True
 
         sd.end()
 
         lat_1km = None
         lon_1km = None
+        geo_source = "MYD06_5KM_REPEAT"
         if myd03_file is not None:
-            geo_1km = read_myd03(myd03_file)
+            geo_1km = read_myd03(myd03_file, ref_dt=ref_dt)
             if geo_1km is not None:
-                lat_1km, lon_1km = geo_1km
+                lat_1km = geo_1km.get("lat_1km")
+                lon_1km = geo_1km.get("lon_1km")
                 if lat_1km.shape != clp_1km.shape or lon_1km.shape != clp_1km.shape:
                     log.warning(
                         "MYD03 shape mismatch %s: lat=%s lon=%s label=%s; fallback to MYD06 5km geo",
@@ -488,6 +553,24 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file:
                     )
                     lat_1km = None
                     lon_1km = None
+                else:
+                    geo_source = "MYD03_1KM"
+                    scan_t = geo_1km.get("scan_time_1km")
+                    scan_time_source = geo_1km.get("scan_time_source", "none")
+                    fallback = (scan_t is None)
+
+        if lat_1km is None and fc.REQUIRE_MYD03_1KM:
+            log.warning("MYD03 1km geolocation required; skip %s", modis_file.name)
+            return None
+
+        if scan_t is None and ref_dt is not None:
+            scan_t = myd06_scan_t
+            scan_time_source = "MYD06_Scan_Start_Time" if scan_t is not None else scan_time_source
+            fallback = (scan_t is None)
+
+        if scan_t is None and fc.REQUIRE_SCAN_TIME:
+            log.warning("scan time required; skip %s", modis_file.name)
+            return None
 
         filt = _apply_qa_filter(
             clp_1km,
@@ -511,7 +594,7 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file:
                 int(np.isfinite(filt["CER"]).sum()),
                 int(np.isfinite(filt["COT"]).sum()),
                 int(np.isfinite(filt["CTH"]).sum()),
-                "pixel-level" if not fallback else "file-level-fallback",
+                scan_time_source if not fallback else "file-level-fallback",
             )
 
         return dict(
@@ -525,6 +608,8 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file:
             CTH_1km=filt["CTH"],
             scan_time_1km=scan_t,
             _scan_time_is_fallback=fallback,
+            _scan_time_source=scan_time_source if not fallback else "file-level-fallback",
+            _geo_source=geo_source,
         )
 
     except Exception as exc:
@@ -536,7 +621,105 @@ def read_myd06(modis_file: Path, agri_dt: Optional[datetime] = None, myd03_file:
 # 质量后处理（apply_quality_filter）
 # ---------------------------------------------------------------------------
 
-def apply_quality_filter(agri: dict, labels: dict) -> dict:
+def _warn_missing_qc_field_once(name: str):
+    if name not in _QC_DIAG_MISSING_WARNED:
+        log.warning("QC diagnostics field unavailable: %s; writing NaN/null where needed", name)
+        _QC_DIAG_MISSING_WARNED.add(name)
+
+
+def _finite_count(arr) -> int:
+    return int(np.isfinite(arr).sum()) if arr is not None else 0
+
+
+def _bool_count(mask) -> int:
+    return int(np.asarray(mask, dtype=bool).sum()) if mask is not None else 0
+
+
+def _finite_stat(arr, fn):
+    if arr is None:
+        return np.nan
+    vals = np.asarray(arr)[np.isfinite(arr)]
+    if vals.size == 0:
+        return np.nan
+    return float(fn(vals))
+
+
+def _mean_finite(arr):
+    return _finite_stat(arr, np.mean)
+
+
+def _build_qc_diagnostics_row(
+    diagnostics: dict,
+    agri: dict,
+    labels: dict,
+    raw_labels: dict,
+    clp_raw: np.ndarray,
+    time_ok: np.ndarray,
+    overlap_ok: np.ndarray,
+    geo_ok: np.ndarray,
+    phase_ok: np.ndarray,
+    reg_time_ok: np.ndarray,
+    reg_overlap_ok: np.ndarray,
+    reg_cloud_ok: np.ndarray,
+    reg_phase_ok: np.ndarray,
+):
+    shape = labels["CLP"].shape
+    ones = np.ones(shape, dtype=bool)
+    clp_base = np.isfinite(clp_raw) & (clp_raw >= 0) & (clp_raw < cfg.CLP_CLASSES)
+    geo_gate = geo_ok if (cfg.CLP_USE_GEO_FILTER or cfg.REG_USE_GEO_FILTER) else ones
+
+    cumulative_after_time = clp_base & time_ok
+    cumulative_after_overlap = cumulative_after_time & overlap_ok
+    cumulative_after_geo = cumulative_after_overlap & geo_gate
+    cumulative_after_phase = cumulative_after_geo & phase_ok
+
+    reg_base = cumulative_after_phase & (clp_raw > 0)
+    cumulative_after_reg_time = reg_base & reg_time_ok
+    cumulative_after_reg_overlap = cumulative_after_reg_time & reg_overlap_ok
+    cumulative_after_reg_cloud = cumulative_after_reg_overlap & reg_cloud_ok
+    cumulative_after_reg_phase = cumulative_after_reg_cloud & reg_phase_ok
+
+    row = {
+        "scene_id": diagnostics.get("scene_id"),
+        "agri_file": diagnostics.get("agri_file"),
+        "myd06_file": diagnostics.get("myd06_file"),
+        "myd03_file": diagnostics.get("myd03_file"),
+        "raw_clp_valid_px": int(clp_base.sum()),
+        "raw_cer_valid_px": _finite_count(raw_labels.get("CER")),
+        "raw_cot_valid_px": _finite_count(raw_labels.get("COT")),
+        "raw_cth_valid_px": _finite_count(raw_labels.get("CTH")),
+        "time_ok_px": _bool_count(time_ok),
+        "overlap_ok_px": _bool_count(overlap_ok),
+        "geo_ok_px": _bool_count(geo_ok),
+        "phase_ok_px": _bool_count(phase_ok),
+        "reg_time_ok_px": _bool_count(reg_time_ok),
+        "reg_overlap_ok_px": _bool_count(reg_overlap_ok),
+        "reg_cloud_ok_px": _bool_count(reg_cloud_ok),
+        "reg_phase_ok_px": _bool_count(reg_phase_ok),
+        "cumulative_base_px": int(clp_base.sum()),
+        "cumulative_after_time_px": int(cumulative_after_time.sum()),
+        "cumulative_after_overlap_px": int(cumulative_after_overlap.sum()),
+        "cumulative_after_geo_px": int(cumulative_after_geo.sum()),
+        "cumulative_after_phase_px": int(cumulative_after_phase.sum()),
+        "cumulative_after_reg_time_px": int(cumulative_after_reg_time.sum()),
+        "cumulative_after_reg_overlap_px": int(cumulative_after_reg_overlap.sum()),
+        "cumulative_after_reg_cloud_px": int(cumulative_after_reg_cloud.sum()),
+        "cumulative_after_reg_phase_px": int(cumulative_after_reg_phase.sum()),
+        "final_clp_px": _finite_count(labels.get("CLP")),
+        "final_cer_px": _finite_count(labels.get("CER")),
+        "final_cot_px": _finite_count(labels.get("COT")),
+        "final_cth_px": _finite_count(labels.get("CTH")),
+        "time_delta_min_p50": _finite_stat(raw_labels.get("MATCH_DT_MIN"), lambda v: np.percentile(v, 50)),
+        "time_delta_min_p90": _finite_stat(raw_labels.get("MATCH_DT_MIN"), lambda v: np.percentile(v, 90)),
+        "time_delta_min_max": _finite_stat(raw_labels.get("MATCH_DT_MIN"), np.max),
+        "overlap_ratio": _mean_finite(raw_labels.get("OVERLAP_FRACTION")),
+        "cloud_frac": _mean_finite(raw_labels.get("CLOUD_FRACTION")),
+        "phase_consistency": _mean_finite(raw_labels.get("PHASE_CONSISTENCY")),
+    }
+    diagnostics["row"] = row
+
+
+def apply_quality_filter(agri: dict, labels: dict, diagnostics: Optional[dict] = None) -> dict:
     """
     融合后的最终质量过滤。
     - 时间差 > TIME_LOW_Q → NaN
@@ -551,12 +734,46 @@ def apply_quality_filter(agri: dict, labels: dict) -> dict:
     )
 
     dt   = labels.get("MATCH_DT_MIN")
+    dt_max = labels.get("MATCH_DT_MAX", dt)
     ovlp = labels.get("OVERLAP_FRACTION")
     phcon= labels.get("PHASE_CONSISTENCY")
+    cfrac = labels.get("CLOUD_FRACTION")
+    raw_diag_labels = None
+    if diagnostics is not None:
+        raw_diag_labels = {
+            k: (v.copy() if isinstance(v, np.ndarray) else v)
+            for k, v in labels.items()
+        }
+    if diagnostics is not None:
+        for name, arr in [
+            ("MATCH_DT_MIN", dt),
+            ("MATCH_DT_MAX", dt_max),
+            ("OVERLAP_FRACTION", ovlp),
+            ("PHASE_CONSISTENCY", phcon),
+            ("CLOUD_FRACTION", cfrac),
+        ]:
+            if arr is None:
+                _warn_missing_qc_field_once(name)
 
     time_ok    = (np.isfinite(dt) & (dt <= fc.TIME_LOW_Q_MIN)) if dt   is not None else np.ones(labels["CLP"].shape, bool)
     overlap_ok = (np.isfinite(ovlp) & (ovlp >= fc.OVERLAP_FRAC_MIN))  if ovlp is not None else np.ones(labels["CLP"].shape, bool)
     phase_ok   = (~np.isfinite(phcon)) | (phcon >= fc.PHASE_CONSISTENCY_MIN) if phcon is not None else np.ones(labels["CLP"].shape, bool)
+    reg_time_ok = (
+        np.isfinite(dt_max) & (dt_max <= fc.REG_TIME_MAX_MIN)
+        if dt_max is not None else np.zeros(labels["CLP"].shape, bool)
+    )
+    reg_overlap_ok = (
+        np.isfinite(ovlp) & (ovlp >= fc.REG_OVERLAP_FRAC_MIN)
+        if ovlp is not None else np.zeros(labels["CLP"].shape, bool)
+    )
+    reg_cloud_ok = (
+        np.isfinite(cfrac) & (cfrac >= fc.REG_CLOUD_FRAC_MIN)
+        if cfrac is not None else np.zeros(labels["CLP"].shape, bool)
+    )
+    reg_phase_ok = (
+        np.isfinite(phcon) & (phcon >= fc.REG_PHASE_CONSISTENCY_MIN)
+        if phcon is not None else np.zeros(labels["CLP"].shape, bool)
+    )
 
     clp_raw = labels["CLP"].copy()
     clp_ok  = (
@@ -571,13 +788,18 @@ def apply_quality_filter(agri: dict, labels: dict) -> dict:
 
     for k, lo, hi in [("CER", 0, 100), ("COT", 0, 200), ("CTH", 0, 25000)]:
         raw = labels[k].copy()
-        ok  = cloudy & np.isfinite(raw) & (raw >= lo) & (raw <= hi) & time_ok & overlap_ok
+        ok  = (
+            cloudy & np.isfinite(raw) & (raw >= lo) & (raw <= hi) &
+            reg_time_ok & reg_overlap_ok & reg_cloud_ok & reg_phase_ok
+        )
         if cfg.REG_USE_GEO_FILTER:
             ok &= geo_ok
         labels[k] = np.where(ok, raw, np.nan)
 
     valid = np.isfinite(labels["CLP"])
-    for k in ["MATCH_DT_MIN", "OVERLAP_FRACTION", "CLOUD_FRACTION", "PHASE_CONSISTENCY"]:
+    for k in ["MATCH_DT_MIN", "MATCH_DT_MEAN", "MATCH_DT_MAX",
+              "MATCH_DIST_MEAN_KM", "MATCH_DIST_P95_KM",
+              "OVERLAP_FRACTION", "CLOUD_FRACTION", "PHASE_CONSISTENCY"]:
         if k in labels:
             labels[k] = np.where(valid, labels[k], np.nan)
     for k in ["VALID_PIX_1KM", "VALID_PIX_5KM"]:
@@ -588,6 +810,13 @@ def apply_quality_filter(agri: dict, labels: dict) -> dict:
 
     for k in ["CER", "COT", "CTH"]:
         labels[k][~cloudy] = np.nan
+
+    if diagnostics is not None:
+        _build_qc_diagnostics_row(
+            diagnostics, agri, labels, raw_diag_labels, clp_raw,
+            time_ok, overlap_ok, geo_ok, phase_ok,
+            reg_time_ok, reg_overlap_ok, reg_cloud_ok, reg_phase_ok,
+        )
 
     if fc.FUSION_LOG_PIXEL_STATS:
         log.info(
@@ -692,8 +921,16 @@ def write_fused_samples(
             "overlap_frac_min": fc.OVERLAP_FRAC_MIN,
             "cloud_frac_min":   fc.CLOUD_FRAC_MIN_CLOUDY,
             "phase_consist_min":fc.PHASE_CONSISTENCY_MIN,
+            "reg_time_max_min": fc.REG_TIME_MAX_MIN,
+            "reg_overlap_frac_min": fc.REG_OVERLAP_FRAC_MIN,
+            "reg_cloud_frac_min": fc.REG_CLOUD_FRAC_MIN,
+            "reg_phase_consist_min": fc.REG_PHASE_CONSISTENCY_MIN,
             "min_valid_label_px": thresh["min_valid_label_pixels"],
             "min_valid_cloudy_px":thresh["min_valid_cloudy_pixels"],
+            "clp_class_names": ",".join(getattr(cfg, "CLP_CLASS_NAMES", [])),
+            "scan_time_sources": ",".join(labels.get("_scan_time_sources", [])),
+            "geo_sources": ",".join(labels.get("_geo_sources", [])),
+            "fallback_granules": int(labels.get("_fallback_granules", 0)),
         })
 
         s = f.create_group("Samples")
@@ -704,7 +941,12 @@ def write_fused_samples(
         ds_col    = _create_ds(s, "col",    (), np.int32)
         ds_clppx  = _create_ds(s, "valid_clp_px",   (), np.int32)
         ds_cldpx  = _create_ds(s, "valid_cloudy_px",(), np.int32)
+        ds_clearpx = _create_ds(s, "valid_clear_px", (), np.int32)
+        ds_waterpx = _create_ds(s, "valid_water_px", (), np.int32)
+        ds_icepx   = _create_ds(s, "valid_ice_px",   (), np.int32)
         ds_dt     = _create_ds(s, "max_time_diff_min",    ())
+        ds_dt_mean = _create_ds(s, "mean_time_diff_min",   ())
+        ds_dist   = _create_ds(s, "p95_match_dist_km",     ())
         ds_ovlp   = _create_ds(s, "mean_overlap_frac",    ())
         ds_wt     = _create_ds(s, "mean_sample_weight",   ())
         ds_cf     = _create_ds(s, "mean_cloud_frac",      ())
@@ -744,7 +986,13 @@ def write_fused_samples(
             _append(ds_col,   np.int32(j))
             _append(ds_clppx, np.int32(n_clp))
             _append(ds_cldpx, np.int32(n_cld))
-            _append(ds_dt,    np.float32(_pmax("MATCH_DT_MIN")))
+            patch_clp = labels["CLP"][i:i+ph, j:j+pw]
+            _append(ds_clearpx, np.int32((np.isfinite(patch_clp) & (patch_clp == 0)).sum()))
+            _append(ds_waterpx, np.int32((np.isfinite(patch_clp) & (patch_clp == 1)).sum()))
+            _append(ds_icepx,   np.int32((np.isfinite(patch_clp) & (patch_clp == 2)).sum()))
+            _append(ds_dt,    np.float32(_pmax("MATCH_DT_MAX")))
+            _append(ds_dt_mean, np.float32(_pmean("MATCH_DT_MEAN")))
+            _append(ds_dist,  np.float32(_pmax("MATCH_DIST_P95_KM")))
             _append(ds_ovlp,  np.float32(_pmean("OVERLAP_FRACTION")))
             _append(ds_wt,    np.float32(_pmean("SAMPLE_WEIGHT")))
             _append(ds_cf,    np.float32(_pmean("CLOUD_FRACTION")))
@@ -785,6 +1033,9 @@ def write_full_disk_hdf5(out_path: Path, agri: dict, labels: dict, agri_dt: date
     with h5py.File(out_path, "w") as f:
         f.attrs["agri_datetime"] = agri_dt.strftime("%Y%m%d%H%M%S")
         f.attrs["agri_channels"] = cfg.AGRI_BT_CHANNEL_INDICES
+        f.attrs["scan_time_sources"] = ",".join(labels.get("_scan_time_sources", []))
+        f.attrs["geo_sources"] = ",".join(labels.get("_geo_sources", []))
+        f.attrs["fallback_granules"] = int(labels.get("_fallback_granules", 0))
 
         g = f.create_group("AGRI/Geolocation")
         for k in ["lat", "lon", "VZA", "SZA"]:
@@ -800,7 +1051,9 @@ def write_full_disk_hdf5(out_path: Path, agri: dict, labels: dict, agri_dt: date
             lbl.create_dataset(k, data=labels[k], compression="gzip", compression_opts=4)
 
         qa = f.create_group("QA")
-        for k in ["MATCH_DT_MIN", "OVERLAP_FRACTION", "VALID_PIX_1KM",
+        for k in ["MATCH_DT_MIN", "MATCH_DT_MEAN", "MATCH_DT_MAX",
+                  "MATCH_DIST_MEAN_KM", "MATCH_DIST_P95_KM",
+                  "OVERLAP_FRACTION", "VALID_PIX_1KM",
                   "VALID_PIX_5KM", "CLOUD_FRACTION", "PHASE_CONSISTENCY", "SAMPLE_WEIGHT"]:
             if k in labels:
                 qa.create_dataset(k, data=labels[k], compression="gzip", compression_opts=4)

@@ -30,7 +30,7 @@ import torch
 from sklearn.metrics import confusion_matrix
 
 import config as cfg
-from dataset import NormStats, build_dataloaders
+from dataset import NormStats, build_test_dataloader
 from model import build_model
 
 log = logging.getLogger(__name__)
@@ -99,34 +99,37 @@ def _plot_scatter(true, pred, label, unit, out_path: Path):
 # Main evaluation function
 # ─────────────────────────────────────────────────────────────────────────────
 from typing import Optional
-def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Evaluating on %s", device)
-
-    checkpoint = checkpoint or cfg.CHECKPOINT_BEST
+def collect_test_predictions(
+    stats: NormStats,
+    checkpoint: Path,
+    test_dl=None,
+    device: Optional[torch.device] = None,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model().to(device)
-    try:
-        model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-        log.info("Loaded checkpoint %s", checkpoint)
-    except FileNotFoundError:
-        log.error("Checkpoint not found: %s", checkpoint)
-        return
+    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
+    log.info("Loaded checkpoint %s", checkpoint)
 
     model.eval()
 
-    _, _, test_dl = build_dataloaders(stats)
+    if test_dl is None:
+        test_dl = build_test_dataloader(stats)
 
     # Accumulators
     all_clp_true, all_clp_pred = [], []
+    all_clp_for_reg = []
     all_cer_true, all_cer_pred = [], []
     all_cot_true, all_cot_pred = [], []
     all_cth_true, all_cth_pred = [], []
+    valid_clp_pixels = 0
+    total_pixels = 0
 
     out_std  = torch.from_numpy(stats.out_std[1:]).to(device).reshape(1, 3, 1, 1)
     out_mean = torch.from_numpy(stats.out_mean[1:]).to(device).reshape(1, 3, 1, 1)
 
     with torch.no_grad():
-        for agri, geo, labels in test_dl:
+        for batch_idx, (agri, geo, labels) in enumerate(test_dl):
             agri   = agri.to(device)
             geo    = geo.to(device)
             labels = labels.to(device)
@@ -137,15 +140,27 @@ def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
             comp_dn = comp_norm * out_std + out_mean
             lbl_dn  = labels[:, 1:] * out_std + out_mean
 
-            # CLP
-            clp_pred_cls = clp_logits.argmax(dim=1).cpu().numpy().ravel()
-            clp_true_cls = labels[:, 0].long().cpu().numpy().ravel()
+            # CLP - evaluate only finite in-range labels, matching train/val masks.
+            clp_true_raw = labels[:, 0]
+            valid_clp = (
+                torch.isfinite(clp_true_raw)
+                & (clp_true_raw >= 0)
+                & (clp_true_raw < cfg.CLP_CLASSES)
+            )
+            batch_valid_clp = int(valid_clp.sum().item())
+            batch_total = int(clp_true_raw.numel())
+            valid_clp_pixels += batch_valid_clp
+            total_pixels += batch_total
+            if batch_valid_clp == 0:
+                log.warning("Batch %d has no valid CLP pixels; skipping CLP metrics for this batch", batch_idx)
 
-            # Regression – only cloudy pixels (CLP > 0)
-            clp_mask = clp_true_cls > 0
+            clp_pred_map = clp_logits.argmax(dim=1)
+            clp_true_cls = clp_true_raw[valid_clp].long().cpu().numpy().ravel()
+            clp_pred_cls = clp_pred_map[valid_clp].cpu().numpy().ravel()
 
             all_clp_true.append(clp_true_cls)
             all_clp_pred.append(clp_pred_cls)
+            all_clp_for_reg.append(clp_true_raw.cpu().numpy().ravel())
             all_cer_true.append(lbl_dn[:, 0].cpu().numpy().ravel())
             all_cer_pred.append(comp_dn[:, 0].cpu().numpy().ravel())
             all_cot_true.append(lbl_dn[:, 1].cpu().numpy().ravel())
@@ -153,25 +168,63 @@ def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
             all_cth_true.append(lbl_dn[:, 2].cpu().numpy().ravel())
             all_cth_pred.append(comp_dn[:, 2].cpu().numpy().ravel())
 
-    clp_true = np.concatenate(all_clp_true)
-    clp_pred = np.concatenate(all_clp_pred)
-    cer_true = np.concatenate(all_cer_true)
-    cer_pred = np.concatenate(all_cer_pred)
-    cot_true = np.concatenate(all_cot_true)
-    cot_pred = np.concatenate(all_cot_pred)
-    cth_true = np.concatenate(all_cth_true)
-    cth_pred = np.concatenate(all_cth_pred)
+    return {
+        "clp_true": np.concatenate(all_clp_true) if all_clp_true else np.array([], dtype=np.int64),
+        "clp_pred": np.concatenate(all_clp_pred) if all_clp_pred else np.array([], dtype=np.int64),
+        "clp_for_reg": np.concatenate(all_clp_for_reg) if all_clp_for_reg else np.array([], dtype=np.float32),
+        "cer_true": np.concatenate(all_cer_true),
+        "cer_pred": np.concatenate(all_cer_pred),
+        "cot_true": np.concatenate(all_cot_true),
+        "cot_pred": np.concatenate(all_cot_pred),
+        "cth_true": np.concatenate(all_cth_true),
+        "cth_pred": np.concatenate(all_cth_pred),
+        "valid_clp_pixels": valid_clp_pixels,
+        "total_pixels": total_pixels,
+    }
+
+
+def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info("Evaluating on %s", device)
+
+    checkpoint = checkpoint or cfg.CHECKPOINT_BEST
+    try:
+        arrays = collect_test_predictions(stats, checkpoint, device=device)
+    except FileNotFoundError:
+        log.error("Checkpoint not found: %s", checkpoint)
+        return
+
+    clp_true = arrays["clp_true"]
+    clp_pred = arrays["clp_pred"]
+    clp_for_reg = arrays["clp_for_reg"]
+    cer_true = arrays["cer_true"]
+    cer_pred = arrays["cer_pred"]
+    cot_true = arrays["cot_true"]
+    cot_pred = arrays["cot_pred"]
+    cth_true = arrays["cth_true"]
+    cth_pred = arrays["cth_pred"]
+    valid_clp_pixels = arrays["valid_clp_pixels"]
+    total_pixels = arrays["total_pixels"]
 
     # Valid masks (cloudy + physically reasonable)
-    cloudy = clp_true > 0
+    cloudy = clp_for_reg > 0
     v_cer  = cloudy & (cer_true >= 0) & (cer_true <= 100) & np.isfinite(cer_true)
     v_cot  = cloudy & (cot_true >= 0) & (cot_true <= 200) & np.isfinite(cot_true)
     v_cth  = cloudy & (cth_true >= 0) & (cth_true <= 25000) & np.isfinite(cth_true)
 
     # ── CLP metrics ───────────────────────────────────────────────────────
-    oa = float((clp_true == clp_pred).mean() * 100)
+    valid_ratio = float(valid_clp_pixels / total_pixels) if total_pixels > 0 else np.nan
+    if valid_clp_pixels == 0:
+        log.warning("No valid CLP pixels found in the test set; CLP metrics are undefined")
+        oa = np.nan
+    else:
+        oa = float((clp_true == clp_pred).mean() * 100)
     cm = confusion_matrix(clp_true, clp_pred, labels=list(range(cfg.CLP_CLASSES)))
-    per_class_acc = cm.diagonal() / cm.sum(axis=1).clip(min=1) * 100
+    class_support = cm.sum(axis=1)
+    per_class_acc = np.full(cfg.CLP_CLASSES, np.nan, dtype=float)
+    valid_classes = class_support > 0
+    per_class_acc[valid_classes] = cm.diagonal()[valid_classes] / class_support[valid_classes] * 100
+    macro_acc = float(per_class_acc[valid_classes].mean()) if valid_classes.any() else np.nan
 
     # ── Regression metrics ────────────────────────────────────────────────
     cer_m = _stats(cer_true, cer_pred, v_cer)
@@ -180,9 +233,14 @@ def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
 
     # ── Print summary ─────────────────────────────────────────────────────
     log.info("─" * 60)
+    log.info(
+        "CLP valid pixels: valid_clp_pixels=%d total_pixels=%d valid_ratio=%.6f",
+        valid_clp_pixels, total_pixels, valid_ratio,
+    )
     log.info("Cloud Phase  – OA = %.2f%%", oa)
+    log.info("Cloud Phase  – macro acc/recall = %.2f%%", macro_acc)
     for i, name in enumerate(PHASE_NAMES):
-        log.info("  %-12s acc = %.2f%%", name, per_class_acc[i])
+        log.info("  %-12s acc/recall = %.2f%%", name, per_class_acc[i])
     for var, m, u in [("CER", cer_m, "µm"), ("COT", cot_m, ""), ("CTH", cth_m, "m")]:
         log.info(
             "%-4s (n=%7d)  RMSE=%.3f %s  MAE=%.3f  Bias=%.3f  R=%.4f",
@@ -193,9 +251,17 @@ def evaluate(stats: NormStats, checkpoint: Optional[Path] = None):
     # ── Save outputs ──────────────────────────────────────────────────────
     cfg.EVAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    rows = [{"variable": "CLP_OA", "value": oa, "unit": "%"}]
+    rows = [
+        {"variable": "valid_clp_pixels", "value": valid_clp_pixels, "unit": "pixels"},
+        {"variable": "total_pixels", "value": total_pixels, "unit": "pixels"},
+        {"variable": "valid_ratio", "value": valid_ratio, "unit": "ratio"},
+        {"variable": "CLP_OA", "value": oa, "unit": "%"},
+        {"variable": "CLP_macro_acc", "value": macro_acc, "unit": "%"},
+        {"variable": "CLP_macro_recall", "value": macro_acc, "unit": "%"},
+    ]
     for i, name in enumerate(PHASE_NAMES):
         rows.append({"variable": f"CLP_{name}_acc", "value": per_class_acc[i], "unit": "%"})
+        rows.append({"variable": f"CLP_{name}_recall", "value": per_class_acc[i], "unit": "%"})
     for var, m, u in [("CER", cer_m, "um"), ("COT", cot_m, ""), ("CTH", cth_m, "m")]:
         for k, v in m.items():
             rows.append({"variable": f"{var}_{k}", "value": v, "unit": u})
