@@ -310,10 +310,7 @@ def _build_patch_index(
     ph, pw = patch_size
     index: List[Tuple[Path, int, int]] = []
 
-    if mode == "train":
-        sh, sw = max(1, ph // 2), max(1, pw // 2)   # 50% overlap
-    else:
-        sh, sw = ph, pw                              # non-overlapping
+    sh, sw = ph, pw  # non-overlapping for all modes
 
     thresholds = get_patch_supervision_thresholds(mode, patch_size)
 
@@ -350,11 +347,11 @@ def _build_patch_index(
                     n_samples = int(samples["agri"].shape[0])
 
                     has_cached_counts = (
-                        "valid_clp_pixels" in samples and "valid_cloudy_pixels" in samples
+                        "valid_clp_px" in samples and "valid_cloudy_px" in samples
                     )
                     if has_cached_counts:
-                        valid_label_pixels = samples["valid_clp_pixels"][()]
-                        valid_cloudy_pixels = samples["valid_cloudy_pixels"][()]
+                        valid_label_pixels = samples["valid_clp_px"][()]
+                        valid_cloudy_pixels = samples["valid_cloudy_px"][()]
                         for s in range(n_samples):
                             if (
                                 int(valid_label_pixels[s]) >= thresholds["min_valid_label_pixels"]

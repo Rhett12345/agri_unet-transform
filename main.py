@@ -46,7 +46,7 @@ def _setup_logging():
 # ---------------------------------------------------------------------------
 
 def stage_fuse(args):
-    """调用新的多进程融合引擎。"""
+    """调用 L1B+L2 配对引擎。"""
     import fusion_config as fc
     from data_fusion import _find_day_folders, fuse_day
     from data_fusion import _reset_qc_diagnostics
@@ -73,24 +73,13 @@ def stage_fuse(args):
     if qc_diag_enabled:
         _reset_qc_diagnostics(qc_diag_dir)
 
-    agri_days  = _find_day_folders(cfg.AGRI_ROOT, dates)
-    modis_days = {d.name: d for d in _find_day_folders(cfg.MODIS_ROOT, dates)}
-    myd03_days = {d.name: d for d in _find_day_folders(cfg.MYD03_ROOT, dates)}
+    agri_days = _find_day_folders(cfg.AGRI_ROOT, dates)
 
     for agri_day in agri_days:
-        modis_day = modis_days.get(agri_day.name)
-        if modis_day is None:
-            log.warning("No MODIS folder for %s - skipping", agri_day.name)
-            continue
-        myd03_day = myd03_days.get(agri_day.name)
-        if myd03_day is None:
-            log.warning("No MYD03 folder for %s - fallback to MYD06 5km geo", agri_day.name)
         out_sub = split_out[split] / agri_day.name
         fuse_day(
             agri_day_dir=agri_day,
-            modis_day_dir=modis_day,
             out_dir=out_sub,
-            myd03_day_dir=myd03_day,
             mode=split,
             overwrite=getattr(args, "overwrite", False),
             n_workers=n_workers,

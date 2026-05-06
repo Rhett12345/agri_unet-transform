@@ -8,9 +8,11 @@ AGRI 和 MYD06 文件读取 + HDF5 写出，与聚合逻辑完全解耦。
   read_agri_scene(path)   → dict(lat, lon, VZA, SZA, BT)
   read_myd06(path)        → dict(lat_5km, lon_5km, lat_1km, lon_1km, CLP_1km,
                                   CTH_1km, scan_time_1km, ...)
+  read_agri_l2_clp(path)  → CLP 2D array (phase-remapped, float32)
+  read_agri_l2_cth(path)  → CTH 2D array (fill-filtered, float32)
   write_fused_hdf5(...)   → 写出 samples_v2 格式 HDF5
 
-注：本模块对 pyhdf / h5py 的依赖都在这里，fusion_core.py 只做纯数值计算。
+注：本模块对 pyhdf / h5py / netCDF4 的依赖都在这里，fusion_core.py 只做纯数值计算。
 """
 
 from __future__ import annotations
@@ -279,6 +281,101 @@ def read_agri_scene(agri_file: Path) -> Optional[dict]:
         return dict(lat=lat, lon=lon, VZA=vza, SZA=sza, BT=BT)
     except Exception as exc:
         log.warning("read_agri_scene failed %s: %s", agri_file, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# AGRI L2 读取（NetCDF）
+# ---------------------------------------------------------------------------
+
+def _extract_timestamp_from_filename(filename: str) -> Optional[str]:
+    """从 FY4A 文件名中提取 YYYYMMDDHHMMSS 时间戳。"""
+    m = re.search(r"_NOM_(\d{8})(\d{6})_", filename)
+    if m:
+        return m.group(1) + m.group(2)
+    # fallback: any 14-digit sequence
+    m = re.search(r"(\d{14})", filename)
+    return m.group(1) if m else None
+
+
+def _find_matching_l2_file(l1_fdi_path: Path, product: str) -> Optional[Path]:
+    """
+    根据 L1B FDI 文件名的时间戳，匹配对应 L2 CLP/CTH .NC 文件。
+    product: "CLP" 或 "CTH"
+    """
+    ts = _extract_timestamp_from_filename(l1_fdi_path.name)
+    if ts is None:
+        log.warning("Cannot extract timestamp from %s", l1_fdi_path.name)
+        return None
+
+    date_str = ts[:8]  # YYYYMMDD
+    l2_dir = cfg.FY4A_L2_ROOT / product / date_str
+    if not l2_dir.is_dir():
+        log.info("L2 %s dir not found for date %s: %s", product, date_str, l2_dir)
+        return None
+
+    # Match by start-time (first 14-digit timestamp in filename)
+    # L2 filename format: FY4A-_AGRI--_N_DISK_1047E_L2-_CLP-_MULT_NOM_YYYYMMDDHHMMSS_...
+    for f in sorted(l2_dir.iterdir()):
+        if not f.name.endswith(".NC"):
+            continue
+        f_ts = _extract_timestamp_from_filename(f.name)
+        if f_ts == ts:
+            return f
+
+    log.info("No matching L2 %s file found for timestamp %s in %s", product, ts, l2_dir)
+    return None
+
+
+def read_agri_l2_clp(nc_path: Path) -> Optional[np.ndarray]:
+    """
+    读取 AGRI L2 CLP NetCDF 文件，返回 phase-remapped float32 数组 (2748×2748)。
+    未映射的类别（126=Space, 127=FillValue 等）设为 NaN。
+    """
+    try:
+        import netCDF4 as nc
+        ds = nc.Dataset(str(nc_path), "r")
+        var = ds.variables["CLP"]
+        var.set_auto_mask(False)
+        raw = np.asarray(var[:], dtype=np.int16)
+        ds.close()
+
+        clp = np.full(raw.shape, np.nan, dtype=np.float32)
+        phase_map = cfg.AGRI_L2_CLP_PHASE_MAP
+        for src_val, dst_val in phase_map.items():
+            mask = raw == src_val
+            clp[mask] = float(dst_val)
+
+        return clp
+    except Exception as exc:
+        log.warning("read_agri_l2_clp failed %s: %s", nc_path, exc)
+        return None
+
+
+def read_agri_l2_cth(nc_path: Path) -> Optional[np.ndarray]:
+    """
+    读取 AGRI L2 CTH NetCDF 文件，返回 float32 数组 (2748×2748)。
+    过滤 FillValue、Space 和 valid_range 外的值，设为 NaN。
+    """
+    try:
+        import netCDF4 as nc
+        ds = nc.Dataset(str(nc_path), "r")
+        var = ds.variables["CTH"]
+        var.set_auto_mask(False)
+        raw = np.asarray(var[:], dtype=np.float32)
+        ds.close()
+
+        vmin, vmax = cfg.AGRI_L2_CTH_VALID_RANGE
+        fill_val = cfg.AGRI_L2_CTH_FILL_VALUE
+
+        cth = raw.copy()
+        cth[(cth <= 0) | (cth >= 65500) | ~np.isfinite(cth)] = np.nan
+        cth[cth < vmin] = np.nan
+        cth[cth > vmax] = np.nan
+
+        return cth
+    except Exception as exc:
+        log.warning("read_agri_l2_cth failed %s: %s", nc_path, exc)
         return None
 
 
@@ -834,7 +931,7 @@ def _iter_patch_positions(labels: dict, patch_size: tuple, mode: str):
     ph, pw = patch_size
     clp, cth = labels["CLP"], labels["CTH"]
     H, W = clp.shape
-    sh, sw = (max(1, ph//2), max(1, pw//2)) if mode == "train" else (ph, pw)
+    sh, sw = ph, pw  # non-overlapping for all modes
 
     h_pos = list(range(0, H - ph + 1, sh))
     if h_pos and h_pos[-1] != H - ph:
@@ -894,9 +991,10 @@ def write_fused_samples(
             "min_valid_label_px": thresh["min_valid_label_pixels"],
             "min_valid_cloudy_px":thresh["min_valid_cloudy_pixels"],
             "clp_class_names": ",".join(getattr(cfg, "CLP_CLASS_NAMES", [])),
-            "scan_time_sources": ",".join(labels.get("_scan_time_sources", [])),
-            "geo_sources": ",".join(labels.get("_geo_sources", [])),
+            "scan_time_sources": ",".join(labels.get("_scan_time_sources", ["agri_l2"])),
+            "geo_sources": ",".join(labels.get("_geo_sources", ["agri_geo"])),
             "fallback_granules": int(labels.get("_fallback_granules", 0)),
+            "label_source": labels.get("_label_source", "agri_l2"),
         })
 
         s = f.create_group("Samples")
@@ -979,7 +1077,7 @@ def _validate_and_finalize(tmp: Path, final: Path, agri_dt: datetime,
         assert n > 0
         assert s["labels"].shape[0] == s["geo"].shape[0] == n
 
-        # 时间差上限校验
+        # 时间差上限校验（仅在有 MODIS 时间差数据时执行）
         dt_arr = s["max_time_diff_min"][()]
         dt_ok  = dt_arr[np.isfinite(dt_arr)]
         if dt_ok.size and float(np.nanmax(dt_ok)) > fc.TIME_LOW_Q_MIN + 1e-6:

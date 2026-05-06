@@ -20,12 +20,13 @@ import random
 import time
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch import optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 
 import config as cfg
 from dataset import NormStats, build_dataloaders
@@ -179,12 +180,14 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
     for c in range(cfg.CLP_CLASSES):
         totals[f"cls{c}_acc"] = 0.0
 
-    for agri, geo, labels in loader:
+    total_batches = len(loader)
+    log_interval = max(1, total_batches // 10)  # log every 10%
+    for batch_idx, (agri, geo, labels) in enumerate(loader):
         agri   = agri.to(device)
         geo    = geo.to(device)
         labels = labels.to(device)
 
-        with autocast(enabled=(scaler is not None)):
+        with autocast(device.type if scaler else "cpu", enabled=(scaler is not None)):
             clp_logits, comp_out = model(agri, geo=geo)
             total, l_clp, l_cth = _compute_losses(
                 clp_logits, comp_out, labels, ce_fn, reg_fn
@@ -216,6 +219,19 @@ def _run_epoch(model, loader, ce_fn, reg_fn, stats, device, optimizer=None, scal
             totals[f"cls{c}_acc"] += max(0.0, m[f"cls{c}_acc"]) * B
         totals["n"]        += B
 
+        if (batch_idx + 1) % log_interval == 0 or batch_idx == total_batches - 1:
+            cur_n = max(totals["n"], 1)
+            tag = "train" if training else "val"
+            log.info(
+                "  %s %d/%d | loss=%.4f clp=%.4f cth=%.4f | OA=%.1f%% | CTH_RMSE=%.0f",
+                tag, batch_idx + 1, total_batches,
+                totals["loss"] / cur_n,
+                totals["clp"] / cur_n,
+                totals["cth"] / cur_n,
+                totals["oa"] / cur_n,
+                totals["cth_rmse"] / cur_n,
+            )
+
     N = max(totals["n"], 1)
     result = {k: v / N for k, v in totals.items() if k != "n"}
     return result
@@ -244,15 +260,33 @@ def train(stats: NormStats):
         optimizer, mode="max", factor=cfg.LR_FACTOR,
         patience=cfg.LR_PATIENCE, min_lr=cfg.MIN_LR
     )
-    scaler = GradScaler() if torch.cuda.is_available() else None
+    scaler = GradScaler(device.type) if torch.cuda.is_available() else None
 
-    log.info("Computing CLP class distribution from training set ...")
+    log.info("Computing CLP class distribution from cached HDF5 metadata ...")
     class_counts = torch.zeros(cfg.CLP_CLASSES, dtype=torch.float32)
-    for _, _, labels in train_dl:
-        clp = labels[:, 0]
-        valid = torch.isfinite(clp) & (clp >= 0) & (clp < cfg.CLP_CLASSES)
-        for c in range(cfg.CLP_CLASSES):
-            class_counts[c] += (valid & (clp == c)).sum().item()
+    # Group samples by HDF5 file path to minimize file open/close overhead
+    from collections import defaultdict
+    file_samples: dict = defaultdict(list)
+    for idx in train_dl.dataset._index:
+        h5f, s_idx, _ = idx
+        file_samples[h5f].append(s_idx)
+    n_scanned = 0
+    total_samples = len(train_dl.dataset)
+    for h5f, sample_indices in file_samples.items():
+        try:
+            with h5py.File(h5f, "r") as f:
+                samples = f["Samples"]
+                for s_idx in sample_indices:
+                    for field, cls_idx in [("valid_clear_px", 0), ("valid_water_px", 1), ("valid_ice_px", 2)]:
+                        if field in samples:
+                            class_counts[cls_idx] += float(samples[field][s_idx])
+                    n_scanned += 1
+        except Exception:
+            n_scanned += len(sample_indices)
+            continue
+        if len(file_samples) <= 20 or n_scanned % 1000000 == 0 or n_scanned == total_samples:
+            log.info("  class distribution: %d/%d samples scanned", n_scanned, total_samples)
+    log.info("  class distribution: %d/%d samples scanned", n_scanned, total_samples)
     total = class_counts.sum()
     pcts = [(class_counts[c] / total * 100).item() for c in range(cfg.CLP_CLASSES)]
     log.info("CLP class distribution: %s",

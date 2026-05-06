@@ -49,9 +49,10 @@ ROOT = _env_path("UNET_WORKDIR", "/data/Data_yuq/unet_workdir")
 #     MODIS_ROOT/<YYYYMMDD>/*.hdf  (MYD06 cloud product files)
 #     MYD03_ROOT/<YYYYMMDD>/*.hdf  (MYD03 1km geolocation files)
 # ─────────────────────────────────────────────────────────────────────────────
-AGRI_ROOT  = Path("/data/Data_yuq/FY4A/")          # parent directory of day-folders
-MODIS_ROOT = Path("/data/Data_yuq/MYD06/")         # parent directory of day-folders
-MYD03_ROOT = Path("/data/Data_yuq/MYD03/")         # parent directory of day-folders
+AGRI_ROOT    = Path("/data/Data_yuq/FY4A/")          # parent directory of day-folders (L1B FDI+GEO)
+FY4A_L2_ROOT = Path("/data/Data_yuq/FY4A_L2/")     # parent directory of L2 CLP/CTH day-folders
+MODIS_ROOT   = Path("/data/Data_yuq/MYD06/")         # parent directory of day-folders
+MYD03_ROOT   = Path("/data/Data_yuq/MYD03/")         # parent directory of day-folders
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Paired HDF output (produced by data_fusion.py)
@@ -126,6 +127,14 @@ CLP_CLASS_NAMES = ["Clear", "Water", "Ice"]
 CLP_LABEL_REMAP = {0: 0, 1: 1, 2: 2, 4: 2}
 MODIS_PHASE_MAP = {0: 0, 1: 1, 2: 2, 3: -1, 4: -1, 5: -1, 6: -1}
 
+# AGRI L2 Cloud Phase → training phase mapping (5 → 3 classes)
+# AGRI L2 values: 0=Clear, 1=Water, 2=Supercooled, 3=Mixed, 4=Ice, 126=Space, 127=Fill
+# Supercooled (2) → Water (1): physically liquid water droplets
+# Mixed (3) → Ice (2): mixed-phase clouds treated as ice-like
+AGRI_L2_CLP_PHASE_MAP = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2}
+AGRI_L2_CTH_VALID_RANGE = (1.0, 20000.0)  # from product metadata valid_range
+AGRI_L2_CTH_FILL_VALUE  = -999.0
+
 # Optical phase (QC only) mapped to the same phase space when需要一致性检查。
 MODIS_OPTICAL_PHASE_MAP = {0: -1, 1: 0, 2: 1, 3: 2, 4: -1}
 
@@ -153,23 +162,23 @@ REG_USE_GEO_FILTER = True
 # 回归监督缺失时训练 loss 会自动 mask，不影响 CLP 分类学习。
 PATCH_FILTER_RULES = {
     "default": {
-        "min_valid_label_pixels": 512,
-        "min_valid_label_ratio": 0.50,
-        "min_valid_cloudy_pixels": 150,
-        "min_valid_cloudy_ratio": 0.15,
+        "min_valid_label_pixels": 1024,
+        "min_valid_label_ratio": 0.25,
+        "min_valid_cloudy_pixels": 300,
+        "min_valid_cloudy_ratio": 0.08,
     },
     "train": {},
     "val": {
-        "min_valid_label_pixels": 256,
-        "min_valid_label_ratio": 0.25,
-        "min_valid_cloudy_pixels": 75,
-        "min_valid_cloudy_ratio": 0.075,
+        "min_valid_label_pixels": 600,
+        "min_valid_label_ratio": 0.15,
+        "min_valid_cloudy_pixels": 200,
+        "min_valid_cloudy_ratio": 0.05,
     },
     "test": {
-        "min_valid_label_pixels": 256,
-        "min_valid_label_ratio": 0.25,
-        "min_valid_cloudy_pixels": 75,
-        "min_valid_cloudy_ratio": 0.075,
+        "min_valid_label_pixels": 600,
+        "min_valid_label_ratio": 0.15,
+        "min_valid_cloudy_pixels": 200,
+        "min_valid_cloudy_ratio": 0.05,
     },
 }
 
@@ -215,34 +224,32 @@ MODIS_REQUIRE_CTH_AUX = False
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Patch / dataset parameters
 # ─────────────────────────────────────────────────────────────────────────────
-PATCH_SIZE    = (32, 32)
-PATCH_OVERLAP = 16          # pixels overlap used in inference sliding window
+PATCH_SIZE    = (64, 64)
+PATCH_OVERLAP = 32          # pixels overlap used in inference sliding window
 
 # Train / val / test date split  (folder names, YYYYMMDD)
 # Leave empty lists to use ALL available days in each split dir.
-# 2019 full-year split from the 36 common FY4A/MYD03/MYD06 dates.
-# Each month contributes two train days; the mid-month day alternates val/test.
+# 2019-04-01 ~ 2019-05-31 (61 days), split by day-of-month % 7:
+#   Train: dom%7 in {0,1,3,4,6} (~43 days)
+#   Val:   dom%7 == 2            (~9 days)
+#   Test:  dom%7 == 5            (~9 days)
 TRAIN_DATES = _env_list("UNET_TRAIN_DATES", [
-    "20190105", "20190125",
-    "20190205", "20190225",
-    "20190305", "20190325",
-    "20190405", "20190425",
-    "20190505", "20190525",
-    "20190605", "20190625",
-    "20190705", "20190725",
-    "20190805", "20190825",
-    "20190905", "20190925",
-    "20191005", "20191025",
-    "20191105", "20191125",
-    "20191205", "20191225",
+    # April (~11 days, every other from the full 21-day train set)
+    "20190401", "20190404", "20190407", "20190410", "20190413",
+    "20190415", "20190418", "20190421", "20190424", "20190427",
+    "20190429",
+    # May (~11 days)
+    "20190501", "20190504", "20190507", "20190510", "20190513",
+    "20190515", "20190518", "20190521", "20190524", "20190527",
+    "20190529", "20190531",
 ])
 VAL_DATES   = _env_list("UNET_VAL_DATES", [
-    "20190115", "20190315", "20190515",
-    "20190715", "20190915", "20191115",
+    "20190402", "20190409", "20190416", "20190423", "20190430",
+    "20190502", "20190509", "20190516", "20190523", "20190530",
 ])
 TEST_DATES  = _env_list("UNET_TEST_DATES", [
-    "20190215", "20190415", "20190615",
-    "20190815", "20191015", "20191215",
+    "20190405", "20190412", "20190419", "20190426",
+    "20190505", "20190512", "20190519", "20190526",
 ])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -255,12 +262,12 @@ GIIRS_CHANNELS = 0                               # not used
 CLP_CLASSES   = len(CLP_CLASS_NAMES)
 COMP_CHANNELS = 1   # CTH only (CER/COT removed)
 
-UNET_BASE_CHANNELS  = 16
+UNET_BASE_CHANNELS  = 64
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9.  Training hyper-parameters
 # ─────────────────────────────────────────────────────────────────────────────
-BATCH_SIZE    = 32
+BATCH_SIZE    = 64
 NUM_EPOCHS    = 30
 LEARNING_RATE = 1e-4
 LR_PATIENCE   = 6
