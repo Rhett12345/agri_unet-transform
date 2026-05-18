@@ -108,7 +108,7 @@ def read_hdf(file_path):
 
 if __name__ == "__main__":
 
-    hdf_dir = "/data/Data_yuq/testdata"
+    hdf_dir = "/data/Data_yuq/testdata/modis"
     for file in os.listdir(hdf_dir):
 
         if file.endswith((".hdf", ".HDF", ".h5")):
